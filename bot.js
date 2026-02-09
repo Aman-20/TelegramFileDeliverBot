@@ -17,7 +17,7 @@ const {
   RENDER_EXTERNAL_URL,
   FORCE_CHANNEL_ID,
   STORAGE_CHANNEL_ID,
-  FAV_LIMIT = '50', // [NEW] Configurable Favorite Limit
+  FAV_LIMIT = '50',
   PRIVATE_AUTO_DELETE_MS = '60000',
   GROUP_AUTO_DELETE_MS = '30000',
   GROUP_COOLDOWN_MS = '10000'
@@ -62,7 +62,7 @@ const FileSchema = new Schema({
   clean_title: String,
   attributes: { type: [String], index: true },
   uploaded_at: { type: Date, default: Date.now, index: true },
-  downloads: { type: Number, default: 0, index: true } // For Trending
+  downloads: { type: Number, default: 0, index: true }
 });
 
 const CounterSchema = new Schema({ _id: String, seq: Number });
@@ -80,9 +80,9 @@ const Favorite = mongoose.model('Favorite', FavoriteSchema);
 
 // --- HELPERS ---
 
-function autoDeleteMessage(bot, chatId, messageId, delayMs) {
+function autoDeleteMessage(bot, chatId, messageId, delayMs = 60000) {
   setTimeout(() => {
-    bot.deleteMessage(chatId, messageId).catch(() => {});
+    bot.deleteMessage(chatId, messageId).catch(() => { });
   }, delayMs);
 }
 
@@ -120,40 +120,59 @@ async function saveUser(msg) {
       { $set: { firstName: msg.from.first_name, username: msg.from.username }, $setOnInsert: { joinedAt: new Date() } },
       { upsert: true }
     );
-  } catch (err) {}
+  } catch (err) { }
 }
 
-async function verifyJoin(chatId, userId) {
+async function verifyJoin(chatId, userId, fileCode = null) {
   if (!FORCE_CHANNEL_ID) return true;
   if (ADMIN_SET.has(userId)) return true;
 
   const cacheKey = `isMember:${userId}`;
   const cached = await redis.get(cacheKey);
-  if (cached) return cached === 'true';
+
+  // 👇 FIX 1: Only return early if they ARE a member. 
+  // If cache says 'false', we ignore it and proceed to send the message.
+  if (cached === 'true') return true;
 
   try {
     const member = await bot.getChatMember(FORCE_CHANNEL_ID, userId);
     const isMember = ['creator', 'administrator', 'member'].includes(member.status);
-    await redis.set(cacheKey, String(isMember), 'EX', isMember ? 300 : 60);
 
-    if (!isMember) {
-      const channelLink = FORCE_CHANNEL_ID.startsWith('@') 
-        ? `https://t.me/${FORCE_CHANNEL_ID.replace('@', '')}` 
-        : await bot.exportChatInviteLink(FORCE_CHANNEL_ID).catch(() => null);
-
-      await bot.sendMessage(chatId, '⚠️ <b>You must join our channel to use this bot.</b>', {
-        parse_mode: 'HTML',
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: '📢 Join Channel', url: channelLink || 'https://t.me/' }],
-            [{ text: '✅ I Have Joined', callback_data: 'CHECK_JOIN' }]
-          ]
-        }
-      });
-      return false;
+    // 👇 FIX 2: Only save to Redis if they ARE a member.
+    // We do NOT save 'false' anymore. This ensures non-members always get the warning.
+    if (isMember) {
+      await redis.set(cacheKey, 'true', 'EX', 300); // Remember 'true' for 5 mins
+      return true;
     }
-    return true;
-  } catch (err) { return true; }
+
+    // --- If we are here, the user is NOT a member ---
+    
+    // Generate Invite Link
+    let channelLink = 'https://t.me/';
+    if (FORCE_CHANNEL_ID.startsWith('@')) {
+      channelLink = `https://t.me/${FORCE_CHANNEL_ID.replace('@', '')}`;
+    } else {
+      try { channelLink = await bot.exportChatInviteLink(FORCE_CHANNEL_ID); } catch (e) {}
+    }
+
+    // Create Button (with hidden file code)
+    const callbackData = fileCode ? `CHECK_JOIN:${fileCode}` : 'CHECK_JOIN';
+
+    await bot.sendMessage(chatId, '⚠️ <b>You must join our channel to use this bot.</b>', {
+      parse_mode: 'HTML',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '📢 Join Channel', url: channelLink }],
+          [{ text: '✅ I Have Joined', callback_data: callbackData }]
+        ]
+      }
+    });
+    return false;
+
+  } catch (err) { 
+    console.error('Force Join Error:', err.message);
+    return true; // If bot crashes (e.g. not admin), let the user pass
+  }
 }
 
 async function checkGroupCooldown(chatId) {
@@ -164,13 +183,12 @@ async function checkGroupCooldown(chatId) {
   return true;
 }
 
-// [OPTIMIZATION] Search Caching Helper
 async function cacheSearchResults(userId, fileIds) {
   const key = `search_res:${userId}`;
   await redis.del(key);
   if (fileIds.length > 0) {
     await redis.rpush(key, ...fileIds);
-    await redis.expire(key, 600); // Cache for 10 minutes
+    await redis.expire(key, 600);
   }
 }
 
@@ -178,17 +196,15 @@ async function getCachedPage(userId, page) {
   const start = page * RESULTS_PER_PAGE_NUM;
   const end = start + RESULTS_PER_PAGE_NUM - 1;
   const key = `search_res:${userId}`;
-  
   const total = await redis.llen(key);
   const ids = await redis.lrange(key, start, end);
-  
   return { ids, total };
 }
 
 function cleanFileName(text) {
   return text.replace(/\.(mkv|mp4|avi|mov|flv|wmv|webm|m4v)$/i, '')
     .replace(/@\w+/g, '')
-    .replace(/[\[\]\(\)\{\}\.\;\:\~\|\,\#\_\-\+]/g, ' ') 
+    .replace(/[\[\]\(\)\{\}\.\;\:\~\|\,\_\-\+]/g, ' ')
     .replace(/\s+/g, ' ').trim();
 }
 
@@ -213,7 +229,17 @@ app.post(`/bot${TELEGRAM_TOKEN}`, (req, res) => {
 app.get('/', (req, res) => res.send('Bot is running. 🚀'));
 app.listen(PORT, () => console.log(`Server on port ${PORT}`));
 
-// --- INDEXING (CHANNEL POSTS) ---
+// --- [FIX] SET COMMAND MENU (No /help here) ---
+bot.setMyCommands([
+  { command: '/start', description: 'Restart Bot' },
+  { command: '/recent', description: 'New Uploads' },
+  { command: '/trending', description: 'Popular Files' },
+  { command: '/favorites', description: 'My Saved Files' },
+  { command: '/myaccount', description: 'Check Limit' },
+]).catch(() => { });
+
+
+// --- INDEXING ---
 bot.on('channel_post', async (msg) => {
   if (String(msg.chat.id) !== STORAGE_CHANNEL_ID) return;
   const file = msg.video || msg.document;
@@ -224,7 +250,7 @@ bot.on('channel_post', async (msg) => {
     const clean = cleanFileName(rawName);
     const size = formatSize(file.file_size);
     const customId = await nextSequence();
-    
+
     await File.create({
       customId,
       message_id: msg.message_id,
@@ -236,23 +262,37 @@ bot.on('channel_post', async (msg) => {
     });
 
     const newCaption = `${msg.caption || ''}\n\n✅ <b>Indexed:</b> ${customId}`;
-    await bot.editMessageCaption(newCaption, { chat_id: msg.chat.id, message_id: msg.message_id, parse_mode: 'HTML' }).catch(() => {});
+    await bot.editMessageCaption(newCaption, { chat_id: msg.chat.id, message_id: msg.message_id, parse_mode: 'HTML' }).catch(() => { });
   } catch (err) { console.error('Index Error:', err); }
 });
 
-// --- COMMAND HANDLERS ---
+// --- COMMANDS ---
 
-// 1. /start (Handles Deep Links & Normal Start)
-bot.onText(/\/start (.+)?/, async (msg, match) => {
+// 1. /start (Fixed Logic)
+bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
   const chatId = msg.chat.id;
   const fromId = String(msg.from.id);
   const startParam = match[1];
 
   await saveUser(msg);
 
-  // Deep Link (File Delivery)
+  if (msg.chat.type !== 'private') {
+    // If it's a deep link (e.g. /start F0001), ignore it (buttons handle this)
+    if (startParam) return; 
+
+    // If plain /start, show a "Go to Private" button
+    const botUsername = (await bot.getMe()).username;
+    const sent = await bot.sendMessage(chatId, `👋 <b>Hello! I work in Private Chat.</b>\nClick below to start:`, {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: '🤖 Start Me', url: `https://t.me/${botUsername}` }]] }
+    });
+    // Delete this message after 10 seconds
+    return autoDeleteMessage(bot, chatId, sent.message_id, 10000);
+  }
+
+  // A. Deep Link Handling
   if (startParam && /^F\d{4}$/i.test(startParam)) {
-    if (msg.chat.type !== 'private') return; // Deep links only work in DM
+    if (msg.chat.type !== 'private') return;
     if (!await verifyJoin(chatId, fromId)) return;
 
     const customId = startParam.toUpperCase();
@@ -265,7 +305,7 @@ bot.onText(/\/start (.+)?/, async (msg, match) => {
     await File.updateOne({ _id: file._id }, { $inc: { downloads: 1 } });
 
     const sent = await bot.copyMessage(chatId, STORAGE_CHANNEL_ID, file.message_id, {
-      caption: `🎬 <b>${file.clean_title}</b>\n📦 ${file.file_size}\n🆔 <code>${file.customId}</code>\n\n⚠️ <i>Auto-deletes in ${PRIVATE_DELETE_TIME/1000}s</i>`,
+      caption: `🎬 <b>${file.clean_title}</b>\n📦 ${file.file_size}\n🆔 <code>${file.customId}</code>\n\n⚠️ <i>Auto-deletes in ${PRIVATE_DELETE_TIME / 1000}s</i>`,
       parse_mode: 'HTML',
       reply_markup: { inline_keyboard: [[{ text: '❤️ Favorite', callback_data: `FAV:${file.customId}` }]] }
     });
@@ -273,14 +313,29 @@ bot.onText(/\/start (.+)?/, async (msg, match) => {
     return;
   }
 
-  // Normal Start
+  // B. Standard Welcome
   if (msg.chat.type === 'private') {
-     if (!await verifyJoin(chatId, fromId)) return;
-     bot.sendMessage(chatId, `👋 <b>Welcome!</b>\n\nType a movie name to search.\n\n/recent - New Files\n/trending - Popular\n/favorites - My List`, { parse_mode: 'HTML' });
+    if (!await verifyJoin(chatId, fromId)) return;
+    bot.sendMessage(chatId, `👋 <b>Welcome!</b>\n\nType a movie name to search.\nUse /help to see how to use.`, { parse_mode: 'HTML' });
   }
 });
 
-// 2. /trending (Works in Group & Private)
+// 2. /help (Smart Help)
+bot.onText(/\/help/, async (msg) => {
+  if (msg.chat.type !== 'private') return; // Ignore in groups
+
+  const isAdmin = ADMIN_SET.has(String(msg.from.id));
+
+  let text = `📚 <b>Help Guide</b>\n\n🔎 <b>Search:</b> Just type the movie name.\n❤️ <b>Favorites:</b> Save files for later.\n📊 <b>Trending:</b> See what's popular.`;
+
+  if (isAdmin) {
+    text += `\n\n👮‍♂️ <b>Admin Commands:</b>\n/stats - Check users\n/broadcast - Message all\n/delete [ID] - Remove file`;
+  }
+
+  bot.sendMessage(msg.chat.id, text, { parse_mode: 'HTML' });
+});
+
+// 3. /trending (Auto-Delete Fix + Group Size Fix)
 bot.onText(/\/trending/, async (msg) => {
   const chatId = msg.chat.id;
   const isGroup = msg.chat.type !== 'private';
@@ -289,22 +344,25 @@ bot.onText(/\/trending/, async (msg) => {
   if (isGroup && !await checkGroupCooldown(chatId)) return;
 
   const files = await File.find().sort({ downloads: -1 }).limit(10).lean();
-  if (!files.length) return bot.sendMessage(chatId, 'No trending files yet.');
+  if (!files.length) {
+    const sent = await bot.sendMessage(chatId, 'No trending files yet.');
+    return autoDeleteMessage(bot, chatId, sent.message_id, 5000);
+  }
 
-  // Group: Preview Mode
   if (isGroup) {
-    const keyboard = files.map(f => [{ text: `🔥 Get ${f.clean_title}`, url: `https://t.me/${botUsername}?start=${f.customId}` }]);
+    // [FIX] Added File Size to Group Button
+    const keyboard = files.map(f => [{ text: `📥 ${f.file_size} | ${f.clean_title}`, url: `https://t.me/${botUsername}?start=${f.customId}` }]);
     const sent = await bot.sendMessage(chatId, '📈 <b>Top Trending:</b>', { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
     autoDeleteMessage(bot, chatId, sent.message_id, GROUP_DELETE_TIME);
-  } 
-  // Private: Full Mode
-  else {
+  } else {
     const keyboard = files.map(f => [{ text: `🔥 ${f.file_size} | ${f.clean_title}`, callback_data: `GET:${f.customId}` }]);
-    bot.sendMessage(chatId, '📈 <b>Top Trending:</b>', { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
+    const sent = await bot.sendMessage(chatId, '📈 <b>Top Trending:</b>', { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
+    // [FIX] Added Auto-Delete for Private
+    autoDeleteMessage(bot, chatId, sent.message_id, PRIVATE_DELETE_TIME);
   }
 });
 
-// 3. /recent (Works in Group & Private)
+// 4. /recent (Auto-Delete Fix + Group Size Fix)
 bot.onText(/\/recent/, async (msg) => {
   const chatId = msg.chat.id;
   const isGroup = msg.chat.type !== 'private';
@@ -313,56 +371,63 @@ bot.onText(/\/recent/, async (msg) => {
   if (isGroup && !await checkGroupCooldown(chatId)) return;
 
   const files = await File.find().sort({ uploaded_at: -1 }).limit(10).lean();
-  if (!files.length) return bot.sendMessage(chatId, 'No recent files.');
+  if (!files.length) {
+    const sent = await bot.sendMessage(chatId, 'No recent files.');
+    return autoDeleteMessage(bot, chatId, sent.message_id, 5000);
+  }
 
-  // Group: Preview Mode
   if (isGroup) {
-    const keyboard = files.map(f => [{ text: `🆕 Get ${f.clean_title}`, url: `https://t.me/${botUsername}?start=${f.customId}` }]);
+    // [FIX] Added File Size to Group Button
+    const keyboard = files.map(f => [{ text: `🆕 ${f.file_size} | ${f.clean_title}`, url: `https://t.me/${botUsername}?start=${f.customId}` }]);
     const sent = await bot.sendMessage(chatId, '🆕 <b>Recent Uploads:</b>', { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
     autoDeleteMessage(bot, chatId, sent.message_id, GROUP_DELETE_TIME);
-  } 
-  // Private: Full Mode
-  else {
+  } else {
     const keyboard = files.map(f => [{ text: `📂 ${f.file_size} | ${f.clean_title}`, callback_data: `GET:${f.customId}` }]);
-    bot.sendMessage(chatId, '🆕 <b>Recent Uploads:</b>', { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
+    const sent = await bot.sendMessage(chatId, '🆕 <b>Recent Uploads:</b>', { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
+    // [FIX] Added Auto-Delete for Private
+    autoDeleteMessage(bot, chatId, sent.message_id, PRIVATE_DELETE_TIME);
   }
 });
 
-// 4. /favorites & /myaccount (Private Only)
+// 5. /favorites & /myaccount (Silent in Groups)
 bot.onText(/\/favorites|\/myaccount/, async (msg) => {
+
   if (msg.chat.type !== 'private') {
-    const sent = await bot.sendMessage(msg.chat.id, '⚠️ <b>Command only for Private Chat.</b>', { parse_mode: 'HTML' });
+    const botUsername = (await bot.getMe()).username;
+    const sent = await bot.sendMessage(msg.chat.id, `⚠️ <b>This command is for Private Chat only!</b>`, { 
+      parse_mode: 'HTML', 
+      reply_markup: { inline_keyboard: [[{ text: '🤖 Open Private Chat', url: `https://t.me/${botUsername}` }]] }
+    });
+    // Delete after 10 seconds
     return autoDeleteMessage(bot, msg.chat.id, sent.message_id, 10000);
   }
-  
+
   if (msg.text.includes('myaccount')) {
     const used = await getUserLimitCount(String(msg.from.id));
-    return bot.sendMessage(msg.chat.id, `👤 <b>Account</b>\nUsed: ${used}/${DAILY_LIMIT_NUM}\nFavorites Limit: ${FAV_LIMIT_NUM}`, { parse_mode: 'HTML' });
+    const sent = await bot.sendMessage(msg.chat.id, `👤 <b>Account</b>\nUsed: ${used}/${DAILY_LIMIT_NUM}\nLimit Resets Daily`, { parse_mode: 'HTML' });
+    return autoDeleteMessage(bot, msg.chat.id, sent.message_id, PRIVATE_DELETE_TIME);
   }
 
-  // Favorites Logic
   const favs = await Favorite.find({ userId: String(msg.from.id) }).lean();
-  if (!favs.length) return bot.sendMessage(msg.chat.id, 'No favorites saved.');
-  
+  if (!favs.length) {
+    const sent = await bot.sendMessage(msg.chat.id, 'No favorites saved.');
+    return autoDeleteMessage(bot, msg.chat.id, sent.message_id, 5000);
+  }
+
   const files = await File.find({ customId: { $in: favs.map(f => f.customId) } }).lean();
   const keyboard = files.map(f => [{ text: `⭐ ${f.file_size} | ${f.clean_title}`, callback_data: `GET:${f.customId}` }]);
-  bot.sendMessage(msg.chat.id, `❤️ <b>Your Favorites:</b>`, { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
+  const sent = await bot.sendMessage(msg.chat.id, `❤️ <b>Your Favorites:</b>`, { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
+  autoDeleteMessage(bot, msg.chat.id, sent.message_id, PRIVATE_DELETE_TIME);
 });
 
 // --- MAIN MESSAGE LOGIC ---
 bot.on('message', async (msg) => {
-  // [FEATURE] Group Greeting (When bot is added)
   if (msg.new_chat_members) {
     const me = await bot.getMe();
     const isMe = msg.new_chat_members.find(m => m.username === me.username);
     if (isMe) {
-      return bot.sendMessage(msg.chat.id, 
-        `👋 <b>Thanks for adding me!</b>\n\n` +
-        `ℹ️ <b>How to use:</b>\n` +
-        `1. Make me an <b>Admin</b> (to delete spam).\n` +
-        `2. Users can type movie names to search.\n` +
-        `3. I will send a download link button (Files are delivered in Private DM).\n\n` +
-        `🚀 <i>Enjoy!</i>`, 
+      return bot.sendMessage(msg.chat.id,
+        `👋 <b>Thanks for adding me!</b>\nJust type a movie name, and I'll find it for you.`,
         { parse_mode: 'HTML' }
       );
     }
@@ -374,55 +439,57 @@ bot.on('message', async (msg) => {
   const isGroup = msg.chat.type !== 'private';
   const text = msg.text.trim();
 
-  // GROUP SEARCH (Preview)
+  // GROUP SEARCH
   if (isGroup) {
     if (!await checkGroupCooldown(chatId)) return;
-    
-    // Simple top 5 search for group
     const keywords = text.toLowerCase().split(' ').filter(Boolean);
     const files = await File.find({ attributes: { $all: keywords } }).limit(5).lean();
 
     if (files.length > 0) {
       const botUsername = (await bot.getMe()).username;
-      const keyboard = files.map(f => [{ text: `📥 Get ${f.clean_title}`, url: `https://t.me/${botUsername}?start=${f.customId}` }]);
+      // [FIX] Added File Size to Group Button
+      const keyboard = files.map(f => [{ text: `📥 ${f.file_size} | ${f.clean_title}`, url: `https://t.me/${botUsername}?start=${f.customId}` }]);
       const sent = await bot.sendMessage(chatId, `🔍 <b>Found ${files.length} results:</b>`, { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
       autoDeleteMessage(bot, chatId, sent.message_id, GROUP_DELETE_TIME);
+    } else {
+      const sent = await bot.sendMessage(chatId, `🤷‍♂️ <b>Could not find "${text}"</b>\nTry checking the spelling.`, { parse_mode: 'HTML' });
+      // Delete this warning after 5 seconds to keep group clean
+      autoDeleteMessage(bot, chatId, sent.message_id, 5000);
     }
     return;
   }
 
-  // PRIVATE SEARCH (Full + Optimized Pagination)
+  // PRIVATE SEARCH
   if (!isGroup) {
     await saveUser(msg);
     if (!await verifyJoin(chatId, String(msg.from.id))) return;
 
     const keywords = text.toLowerCase().split(' ').filter(Boolean);
-    
-    // [OPTIMIZATION] 1. Fetch ALL IDs only (Projection) - Fast!
     const allMatches = await File.find({ attributes: { $all: keywords } })
       .select('customId')
       .sort({ uploaded_at: -1 })
-      .limit(100) // Safety Cap for performance
+      .limit(100)
       .lean();
 
     if (!allMatches.length) {
       const sent = await bot.sendMessage(chatId, '🔍 No results.');
+      // [FIX] Added Delay to "No Results" message
       return autoDeleteMessage(bot, chatId, sent.message_id, 3000);
     }
 
-    // [OPTIMIZATION] 2. Cache IDs in Redis
     const fileIds = allMatches.map(f => f.customId);
     await cacheSearchResults(String(msg.from.id), fileIds);
 
-    // [OPTIMIZATION] 3. Get Page 0 details (Slice from Redis Logic)
     const { ids, total } = await getCachedPage(String(msg.from.id), 0);
     const files = await File.find({ customId: { $in: ids } }).sort({ uploaded_at: -1 }).lean();
 
     const keyboard = files.map(f => [{ text: `📂 ${f.file_size} | ${f.clean_title}`, callback_data: `GET:${f.customId}` }]);
-    if (total > RESULTS_PER_PAGE_NUM) keyboard.push([{ text: `Page 1 of ${Math.ceil(total/RESULTS_PER_PAGE_NUM)} ➡️`, callback_data: `PAGE:1` }]);
+    if (total > RESULTS_PER_PAGE_NUM) keyboard.push([{ text: `Page 1 of ${Math.ceil(total / RESULTS_PER_PAGE_NUM)} ➡️`, callback_data: `PAGE:1` }]);
 
     const sent = await bot.sendMessage(chatId, `🔍 Found <b>${total}</b> files:`, { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
-    autoDeleteMessage(bot, chatId, sent.message_id);
+
+    // [FIX] Instant Delete Solved: Added PRIVATE_DELETE_TIME
+    autoDeleteMessage(bot, chatId, sent.message_id, PRIVATE_DELETE_TIME);
   }
 });
 
@@ -435,10 +502,10 @@ bot.on('callback_query', async (q) => {
   if (data === 'CHECK_JOIN') {
     await redis.del(`isMember:${fromId}`);
     if (await verifyJoin(chatId, fromId)) {
-       bot.sendMessage(chatId, '✅ Thanks! You can now search.');
-       bot.deleteMessage(chatId, q.message.message_id).catch(() => {});
+      bot.sendMessage(chatId, '✅ Thanks! You can now search.');
+      bot.deleteMessage(chatId, q.message.message_id).catch(() => { });
     } else {
-       bot.answerCallbackQuery(q.id, { text: '❌ Not joined!', show_alert: true });
+      bot.answerCallbackQuery(q.id, { text: '❌ Not joined!', show_alert: true });
     }
     return;
   }
@@ -446,21 +513,18 @@ bot.on('callback_query', async (q) => {
   if (!await verifyJoin(chatId, fromId)) return bot.answerCallbackQuery(q.id, { text: 'Join channel first!' });
 
   try {
-    // [OPTIMIZATION] Pagination from Redis
     if (data.startsWith('PAGE:')) {
       const page = Number(data.split(':')[1]);
       const { ids, total } = await getCachedPage(fromId, page);
-      
-      if (!ids.length) return bot.answerCallbackQuery(q.id, { text: 'Search expired. Type query again.' });
 
-      // Fetch full details ONLY for these 10 items (Very fast)
+      if (!ids.length) return bot.answerCallbackQuery(q.id, { text: 'Search expired.' });
+
       const files = await File.find({ customId: { $in: ids } }).sort({ uploaded_at: -1 }).lean();
-
       const keyboard = files.map(f => [{ text: `📂 ${f.file_size} | ${f.clean_title}`, callback_data: `GET:${f.customId}` }]);
-      
+
       const nav = [];
-      if (page > 0) nav.push({ text: '⬅️', callback_data: `PAGE:${page-1}` });
-      if ((page + 1) * RESULTS_PER_PAGE_NUM < total) nav.push({ text: '➡️', callback_data: `PAGE:${page+1}` });
+      if (page > 0) nav.push({ text: '⬅️', callback_data: `PAGE:${page - 1}` });
+      if ((page + 1) * RESULTS_PER_PAGE_NUM < total) nav.push({ text: '➡️', callback_data: `PAGE:${page + 1}` });
       if (nav.length) keyboard.push(nav);
 
       await bot.editMessageText(`🔍 Results (Page ${page + 1})`, {
@@ -483,7 +547,7 @@ bot.on('callback_query', async (q) => {
       await File.updateOne({ _id: file._id }, { $inc: { downloads: 1 } });
 
       const sent = await bot.copyMessage(chatId, STORAGE_CHANNEL_ID, file.message_id, {
-        caption: `🎬 <b>${file.clean_title}</b>\n📦 ${file.file_size}\n🆔 <code>${file.customId}</code>\n\n⚠️ <i>Auto-deletes in ${PRIVATE_DELETE_TIME/1000}s</i>`,
+        caption: `🎬 <b>${file.clean_title}</b>\n📦 ${file.file_size}\n🆔 <code>${file.customId}</code>\n\n⚠️ <i>Auto-deletes in ${PRIVATE_DELETE_TIME / 1000}s</i>`,
         parse_mode: 'HTML',
         reply_markup: { inline_keyboard: [[{ text: '❤️ Favorite', callback_data: `FAV:${file.customId}` }]] }
       });
@@ -494,15 +558,14 @@ bot.on('callback_query', async (q) => {
     if (data.startsWith('FAV:')) {
       const customId = data.split(':')[1];
       const exists = await Favorite.findOne({ userId: fromId, customId });
-      
+
       if (exists) {
         await Favorite.deleteOne({ userId: fromId, customId });
         bot.answerCallbackQuery(q.id, { text: 'Removed' });
       } else {
         const count = await Favorite.countDocuments({ userId: fromId });
-        // [NEW] Check against Limit from .env
         if (count >= FAV_LIMIT_NUM) return bot.answerCallbackQuery(q.id, { text: `Max ${FAV_LIMIT_NUM} favorites allowed.` });
-        
+
         await Favorite.create({ userId: fromId, customId });
         bot.answerCallbackQuery(q.id, { text: 'Saved' });
       }
