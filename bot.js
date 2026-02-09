@@ -146,13 +146,13 @@ async function verifyJoin(chatId, userId, fileCode = null) {
     }
 
     // --- If we are here, the user is NOT a member ---
-    
+
     // Generate Invite Link
     let channelLink = 'https://t.me/';
     if (FORCE_CHANNEL_ID.startsWith('@')) {
       channelLink = `https://t.me/${FORCE_CHANNEL_ID.replace('@', '')}`;
     } else {
-      try { channelLink = await bot.exportChatInviteLink(FORCE_CHANNEL_ID); } catch (e) {}
+      try { channelLink = await bot.exportChatInviteLink(FORCE_CHANNEL_ID); } catch (e) { }
     }
 
     // Create Button (with hidden file code)
@@ -169,7 +169,7 @@ async function verifyJoin(chatId, userId, fileCode = null) {
     });
     return false;
 
-  } catch (err) { 
+  } catch (err) {
     console.error('Force Join Error:', err.message);
     return true; // If bot crashes (e.g. not admin), let the user pass
   }
@@ -278,7 +278,7 @@ bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
 
   if (msg.chat.type !== 'private') {
     // If it's a deep link (e.g. /start F0001), ignore it (buttons handle this)
-    if (startParam) return; 
+    if (startParam) return;
 
     // If plain /start, show a "Go to Private" button
     const botUsername = (await bot.getMe()).username;
@@ -316,8 +316,15 @@ bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
   // B. Standard Welcome
   if (msg.chat.type === 'private') {
     if (!await verifyJoin(chatId, fromId)) return;
-    bot.sendMessage(chatId, `👋 <b>Welcome!</b>\n\nType a movie name to search.\nUse /help to see how to use.`, { parse_mode: 'HTML' });
+    bot.sendMessage(chatId, `👋 <b>Welcome, ${msg.from.first_name}!</b>
+
+🔎 <b>How to search:</b>
+Simply type the name of the movie.
+<i>Example: "Avengers" or "Breaking Bad"</i>
+
+📂Use /help for more Details`, { parse_mode: 'HTML' });
   }
+
 });
 
 // 2. /help (Smart Help)
@@ -350,15 +357,29 @@ bot.onText(/\/trending/, async (msg) => {
   }
 
   if (isGroup) {
-    // [FIX] Added File Size to Group Button
+
     const keyboard = files.map(f => [{ text: `📥 ${f.file_size} | ${f.clean_title}`, url: `https://t.me/${botUsername}?start=${f.customId}` }]);
-    const sent = await bot.sendMessage(chatId, '📈 <b>Top Trending:</b>', { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
-    autoDeleteMessage(bot, chatId, sent.message_id, GROUP_DELETE_TIME);
+
+    try {
+      const sent = await bot.sendMessage(chatId, '📈 <b>Top Trending:</b>', { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
+      if (sent) {
+        autoDeleteMessage(bot, chatId, sent.message_id, GROUP_DELETE_TIME);
+      }
+    } catch (err) {
+      console.log(`Error sending message to ${chatId}: ${err.message}`);
+    }
   } else {
     const keyboard = files.map(f => [{ text: `🔥 ${f.file_size} | ${f.clean_title}`, callback_data: `GET:${f.customId}` }]);
-    const sent = await bot.sendMessage(chatId, '📈 <b>Top Trending:</b>', { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
-    // [FIX] Added Auto-Delete for Private
-    autoDeleteMessage(bot, chatId, sent.message_id, PRIVATE_DELETE_TIME);
+
+    try {
+      const sent = await bot.sendMessage(chatId, '📈 <b>Top Trending:</b>', { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
+
+      if (sent) {
+        autoDeleteMessage(bot, chatId, sent.message_id, PRIVATE_DELETE_TIME);
+      }
+    } catch (err) {
+      console.log(`Error sending message to ${chatId}: ${err.message}`);
+    }
   }
 });
 
@@ -379,13 +400,27 @@ bot.onText(/\/recent/, async (msg) => {
   if (isGroup) {
     // [FIX] Added File Size to Group Button
     const keyboard = files.map(f => [{ text: `🆕 ${f.file_size} | ${f.clean_title}`, url: `https://t.me/${botUsername}?start=${f.customId}` }]);
-    const sent = await bot.sendMessage(chatId, '🆕 <b>Recent Uploads:</b>', { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
-    autoDeleteMessage(bot, chatId, sent.message_id, GROUP_DELETE_TIME);
+    try {
+      const sent = await bot.sendMessage(chatId, '🆕 <b>Recent Uploads:</b>', { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
+
+      if (sent) {
+        autoDeleteMessage(bot, chatId, sent.message_id, GROUP_DELETE_TIME);
+      }
+    } catch (err) {
+      console.log(`Error sending message to ${chatId}: ${err.message}`);
+
+    }
   } else {
     const keyboard = files.map(f => [{ text: `📂 ${f.file_size} | ${f.clean_title}`, callback_data: `GET:${f.customId}` }]);
-    const sent = await bot.sendMessage(chatId, '🆕 <b>Recent Uploads:</b>', { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
-    // [FIX] Added Auto-Delete for Private
-    autoDeleteMessage(bot, chatId, sent.message_id, PRIVATE_DELETE_TIME);
+    try {
+      const sent = await bot.sendMessage(chatId, '🆕 <b>Recent Uploads:</b>', { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
+
+      if (sent) {
+        autoDeleteMessage(bot, chatId, sent.message_id, PRIVATE_DELETE_TIME);
+      }
+    } catch (err) {
+      console.log(`Error sending message to ${chatId}: ${err.message}`);
+    }
   }
 });
 
@@ -394,8 +429,8 @@ bot.onText(/\/favorites|\/myaccount/, async (msg) => {
 
   if (msg.chat.type !== 'private') {
     const botUsername = (await bot.getMe()).username;
-    const sent = await bot.sendMessage(msg.chat.id, `⚠️ <b>This command is for Private Chat only!</b>`, { 
-      parse_mode: 'HTML', 
+    const sent = await bot.sendMessage(msg.chat.id, `⚠️ <b>This command is for Private Chat only!</b>`, {
+      parse_mode: 'HTML',
       reply_markup: { inline_keyboard: [[{ text: '🤖 Open Private Chat', url: `https://t.me/${botUsername}` }]] }
     });
     // Delete after 10 seconds
@@ -420,6 +455,75 @@ bot.onText(/\/favorites|\/myaccount/, async (msg) => {
   autoDeleteMessage(bot, msg.chat.id, sent.message_id, PRIVATE_DELETE_TIME);
 });
 
+// 6. /stats (Admin Only)
+bot.onText(/\/stats/, async (msg) => {
+  if (!ADMIN_SET.has(String(msg.from.id))) return; // Security Check
+
+  const userCount = await User.countDocuments();
+  const fileCount = await File.countDocuments();
+
+  bot.sendMessage(msg.chat.id, `📊 <b>Bot Statistics</b>\n\n👥 Users: ${userCount}\n📂 Files: ${fileCount}`, { parse_mode: 'HTML' });
+});
+
+// 7. /broadcast (Admin Only)
+bot.onText(/\/broadcast(?: (.+))?/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const fromId = String(msg.from.id);
+
+  if (!ADMIN_SET.has(fromId)) return;
+
+  const text = match[1];
+  const replyMsg = msg.reply_to_message;
+
+  if (!text && !replyMsg) {
+    return bot.sendMessage(chatId, '⚠️ Usage:\n1. <code>/broadcast Message</code>\n2. Reply to a message with <code>/broadcast</code>', { parse_mode: 'HTML' });
+  }
+
+  const users = await User.find({}, { userId: 1 }).lean();
+  let success = 0, blocked = 0;
+
+  const sentMsg = await bot.sendMessage(chatId, `🚀 Broadcasting to ${users.length} users...`);
+
+  // Broadcast Loop
+  for (const user of users) {
+    try {
+      if (replyMsg) {
+        // Copy message (supports images, videos, etc.)
+        await bot.copyMessage(user.userId, chatId, replyMsg.message_id);
+      } else {
+        // Send Text
+        await bot.sendMessage(user.userId, text, { parse_mode: 'HTML' });
+      }
+      success++;
+    } catch (err) {
+      // Error 403 means user blocked bot
+      if (err.response && err.response.statusCode === 403) blocked++;
+    }
+    // Tiny delay to prevent 429 errors
+    await new Promise(r => setTimeout(r, 50));
+  }
+
+  bot.editMessageText(`✅ <b>Broadcast Complete</b>\n\nSent: ${success}\nBlocked/Failed: ${blocked}`, {
+    chat_id: chatId,
+    message_id: sentMsg.message_id,
+    parse_mode: 'HTML'
+  });
+});
+
+// 8. /delete (Admin Only)
+bot.onText(/\/delete (.+)/, async (msg, match) => {
+  if (!ADMIN_SET.has(String(msg.from.id))) return; // Security Check
+
+  const customId = match[1].trim();
+  const result = await File.deleteOne({ customId });
+
+  if (result.deletedCount > 0) {
+    bot.sendMessage(msg.chat.id, `🗑️ <b>Deleted:</b> File <code>${customId}</code> has been removed from the database.`, { parse_mode: 'HTML' });
+  } else {
+    bot.sendMessage(msg.chat.id, `❌ <b>Error:</b> File <code>${customId}</code> not found.`, { parse_mode: 'HTML' });
+  }
+});
+
 // --- MAIN MESSAGE LOGIC ---
 bot.on('message', async (msg) => {
   if (msg.new_chat_members) {
@@ -427,7 +531,12 @@ bot.on('message', async (msg) => {
     const isMe = msg.new_chat_members.find(m => m.username === me.username);
     if (isMe) {
       return bot.sendMessage(msg.chat.id,
-        `👋 <b>Thanks for adding me!</b>\nJust type a movie name, and I'll find it for you.`,
+        `👋 <b>Thanks for adding me!</b>\n\n` +
+        `ℹ️ <b>How to use:</b>\n` +
+        `1. Make me an <b>Admin</b>.\n` +
+        `2. Users can type movie names to search.\n` +
+        `3. I will send a download link button (Files are delivered in Private DM).\n\n` +
+        `🚀 <i>Enjoy!</i>`,
         { parse_mode: 'HTML' }
       );
     }
@@ -449,12 +558,27 @@ bot.on('message', async (msg) => {
       const botUsername = (await bot.getMe()).username;
       // [FIX] Added File Size to Group Button
       const keyboard = files.map(f => [{ text: `📥 ${f.file_size} | ${f.clean_title}`, url: `https://t.me/${botUsername}?start=${f.customId}` }]);
-      const sent = await bot.sendMessage(chatId, `🔍 <b>Found ${files.length} results:</b>`, { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
-      autoDeleteMessage(bot, chatId, sent.message_id, GROUP_DELETE_TIME);
+
+      try {
+        const sent = await bot.sendMessage(chatId, `🔍 <b>Found ${files.length} results:</b>`, { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
+        if (sent) {
+          autoDeleteMessage(bot, chatId, sent.message_id, GROUP_DELETE_TIME);
+        }
+      } catch (err) {
+        console.log(`Error sending message to ${chatId}: ${err.message}`);
+      }
+
+
     } else {
-      const sent = await bot.sendMessage(chatId, `🤷‍♂️ <b>Could not find "${text}"</b>\nTry checking the spelling.`, { parse_mode: 'HTML' });
-      // Delete this warning after 5 seconds to keep group clean
-      autoDeleteMessage(bot, chatId, sent.message_id, 5000);
+
+      try {
+        const sent = await bot.sendMessage(chatId, `🤷‍♂️ <b>Could not find "${text}"</b>\nTry checking the spelling.`, { parse_mode: 'HTML' });
+        if (sent) {
+          autoDeleteMessage(bot, chatId, sent.message_id, 5000);
+        }
+      } catch (err) {
+        console.log(`Error sending message to ${chatId}: ${err.message}`);
+      }
     }
     return;
   }
@@ -486,10 +610,15 @@ bot.on('message', async (msg) => {
     const keyboard = files.map(f => [{ text: `📂 ${f.file_size} | ${f.clean_title}`, callback_data: `GET:${f.customId}` }]);
     if (total > RESULTS_PER_PAGE_NUM) keyboard.push([{ text: `Page 1 of ${Math.ceil(total / RESULTS_PER_PAGE_NUM)} ➡️`, callback_data: `PAGE:1` }]);
 
-    const sent = await bot.sendMessage(chatId, `🔍 Found <b>${total}</b> files:`, { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
+    try {
+      const sent = await bot.sendMessage(chatId, `🔍 Found <b>${total}</b> files:`, { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
 
-    // [FIX] Instant Delete Solved: Added PRIVATE_DELETE_TIME
-    autoDeleteMessage(bot, chatId, sent.message_id, PRIVATE_DELETE_TIME);
+      if (sent) {
+        autoDeleteMessage(bot, chatId, sent.message_id, PRIVATE_DELETE_TIME);
+      }
+    } catch (err) {
+      console.log(`Error sending message to ${chatId}: ${err.message}`);
+    }
   }
 });
 
