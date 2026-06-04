@@ -65,7 +65,26 @@ try {
     dbName: 'TelegramMovies'
   });
   console.log('✅ MongoDB Connected');
-  
+
+  // Drop any stale unique indexes on searchcaches that would cause E11000 errors.
+  // This runs once at startup and is safe to re-run on every deploy.
+  try {
+    const scCollection = mongoose.connection.db.collection('searchcaches');
+    const indexes = await scCollection.indexes();
+    for (const idx of indexes) {
+      const isStaleUnique = idx.unique && (
+        (Object.keys(idx.key).length === 1 && idx.key.userId) ||   // old userId_1 index
+        (idx.key.userId && idx.key.searchId)                        // old compound unique index
+      );
+      if (isStaleUnique) {
+        await scCollection.dropIndex(idx.name);
+        console.log(`🧹 Dropped stale index: ${idx.name}`);
+      }
+    }
+  } catch (idxErr) {
+    console.warn('⚠️ Could not clean stale indexes (non-fatal):', idxErr.message);
+  }
+
 } catch (err) {
   console.error('❌ MongoDB Connection Failed:', err);
   process.exit(1);
@@ -123,14 +142,15 @@ const MemberCacheSchema = new Schema({
 const MemberCache = mongoose.model('MemberCache', MemberCacheSchema);
 
 // Search result pages – auto-deleted after SEARCH_CACHE_DOC_TTL_DAYS day(s)
-// Each search gets a unique searchId so new searches never overwrite an in-progress pagination session.
+// Each search gets a unique searchId per session so pagination is never broken by a new search.
+// NO unique indexes – avoids E11000 errors from any stale MongoDB indexes.
 const SearchCacheSchema = new Schema({
   userId:    { type: String, index: true },
-  searchId:  { type: String, index: true },   // unique token per search session
+  searchId:  { type: String, index: true },
   fileIds:   [String],
   updatedAt: { type: Date, default: Date.now, expires: Number(SEARCH_CACHE_DOC_TTL_DAYS) * 86400 }
 });
-SearchCacheSchema.index({ userId: 1, searchId: 1 }, { unique: true });
+// No unique constraint needed – searchId uniqueness is guaranteed by the random+timestamp generator.
 const SearchCache = mongoose.model('SearchCache', SearchCacheSchema);
 
 // Group cooldown – auto-deleted after 1 day (they are very short-lived anyway)
