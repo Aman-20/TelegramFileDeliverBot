@@ -123,11 +123,14 @@ const MemberCacheSchema = new Schema({
 const MemberCache = mongoose.model('MemberCache', MemberCacheSchema);
 
 // Search result pages – auto-deleted after SEARCH_CACHE_DOC_TTL_DAYS day(s)
+// Each search gets a unique searchId so new searches never overwrite an in-progress pagination session.
 const SearchCacheSchema = new Schema({
-  userId:    { type: String, unique: true, index: true },
+  userId:    { type: String, index: true },
+  searchId:  { type: String, index: true },   // unique token per search session
   fileIds:   [String],
   updatedAt: { type: Date, default: Date.now, expires: Number(SEARCH_CACHE_DOC_TTL_DAYS) * 86400 }
 });
+SearchCacheSchema.index({ userId: 1, searchId: 1 }, { unique: true });
 const SearchCache = mongoose.model('SearchCache', SearchCacheSchema);
 
 // Group cooldown – auto-deleted after 1 day (they are very short-lived anyway)
@@ -238,16 +241,15 @@ async function checkGroupCooldown(chatId) {
 }
 
 // Search result cache backed by MongoDB (replaces Redis search_res:*)
+// Returns a unique searchId for this session so pagination won't be broken by subsequent searches.
 async function cacheSearchResults(userId, fileIds) {
-  await SearchCache.findOneAndUpdate(
-    { userId },
-    { fileIds, updatedAt: new Date() },
-    { upsert: true }
-  );
+  const searchId = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  await SearchCache.create({ userId, searchId, fileIds, updatedAt: new Date() });
+  return searchId;
 }
 
-async function getCachedPage(userId, page) {
-  const doc = await SearchCache.findOne({ userId }).lean();
+async function getCachedPage(userId, searchId, page) {
+  const doc = await SearchCache.findOne({ userId, searchId }).lean();
   if (!doc) return { ids: [], total: 0 };
   const total = doc.fileIds.length;
   const start = page * RESULTS_PER_PAGE_NUM;
@@ -845,58 +847,71 @@ bot.on('message', async (msg) => {
   await saveUser(msg);
   if (!await verifyJoin(chatId, fromId)) return;
 
-  const { files: allMatches, isFuzzy } = await searchFiles(text, 100);
+  // Bug fix 1: wrap entire search in try/catch so any DB or search error
+  // sends a user-facing message instead of silently killing the handler.
+  try {
+    const { files: allMatches, isFuzzy } = await searchFiles(text, 100);
 
-  if (!allMatches.length) {
-    const suggestions = await getSearchSuggestions(text);
-    let noResultText = `🔍 <b>No results for "${text}".</b>`;
+    if (!allMatches.length) {
+      const suggestions = await getSearchSuggestions(text);
+      let noResultText = `🔍 <b>No results for "${text}".</b>`;
 
-    if (suggestions.length) {
-      noResultText += `\n\n💡 <b>Did you mean one of these?</b>`;
-      const suggKeyboard = suggestions.map(s => [{
-        text: `🔎 ${s.clean_title}`,
-        callback_data: `SEARCH_SUGGEST:${s.clean_title}`
-      }]);
-      const sent = await bot.sendMessage(chatId, noResultText, {
-        parse_mode: 'HTML',
-        reply_markup: { inline_keyboard: suggKeyboard }
-      });
-      return autoDeleteMessage(bot, chatId, sent.message_id, PRIVATE_DELETE_TIME);
+      if (suggestions.length) {
+        noResultText += `\n\n💡 <b>Did you mean one of these?</b>`;
+        const suggKeyboard = suggestions.map(s => [{
+          text: `🔎 ${s.clean_title}`,
+          callback_data: `SEARCH_SUGGEST:${s.clean_title}`
+        }]);
+        const sent = await bot.sendMessage(chatId, noResultText, {
+          parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: suggKeyboard }
+        });
+        return autoDeleteMessage(bot, chatId, sent.message_id, PRIVATE_DELETE_TIME);
+      }
+
+      const sent = await bot.sendMessage(chatId, noResultText, { parse_mode: 'HTML' });
+      return autoDeleteMessage(bot, chatId, sent.message_id, NO_RESULT_DELETE_TIME);
     }
 
-    const sent = await bot.sendMessage(chatId, noResultText, { parse_mode: 'HTML' });
-    return autoDeleteMessage(bot, chatId, sent.message_id, NO_RESULT_DELETE_TIME);
-  }
+    const fileIds = allMatches.map(f => f.customId);
+    // Bug fix 2: cacheSearchResults now returns a unique searchId per search session,
+    // so a new search never overwrites the cache of an in-progress pagination session.
+    const searchId = await cacheSearchResults(fromId, fileIds);
 
-  const fileIds = allMatches.map(f => f.customId);
-  await cacheSearchResults(fromId, fileIds);
+    const { ids, total } = await getCachedPage(fromId, searchId, 0);
+    const files = await File.find({ customId: { $in: ids } }).sort({ uploaded_at: -1 }).lean();
 
-  const { ids, total } = await getCachedPage(fromId, 0);
-  const files = await File.find({ customId: { $in: ids } }).sort({ uploaded_at: -1 }).lean();
+    const header = isFuzzy
+      ? `🔍 Found <b>${total}</b> fuzzy match(es) for "<i>${text}</i>":` 
+      : `🔍 Found <b>${total}</b> file(s):`;
 
-  const header = isFuzzy
-    ? `🔍 Found <b>${total}</b> fuzzy match(es) for "<i>${text}</i>":` 
-    : `🔍 Found <b>${total}</b> file(s):`;
-
-  // Landscape-aware: show more detail in button label
-  // Telegram doesn't expose orientation, but we send a rich label so landscape sees it better
-  const keyboard = files.map(f => [{
-    text: `📂 ${f.type === 'video' ? '🎬' : '📄'} ${f.clean_title} • ${f.file_size}`,
-    callback_data: `GET:${f.customId}`
-  }]);
-
-  if (total > RESULTS_PER_PAGE_NUM) {
-    keyboard.push([{
-      text: `Page 1 of ${Math.ceil(total / RESULTS_PER_PAGE_NUM)} ➡️`,
-      callback_data: `PAGE:1`
+    const keyboard = files.map(f => [{
+      text: `📂 ${f.type === 'video' ? '🎬' : '📄'} ${f.clean_title} • ${f.file_size}`,
+      callback_data: `GET:${f.customId}`
     }]);
-  }
 
-  const sent = await bot.sendMessage(chatId, header, {
-    parse_mode: 'HTML',
-    reply_markup: { inline_keyboard: keyboard }
-  }).catch(() => null);
-  if (sent) autoDeleteMessage(bot, chatId, sent.message_id, PRIVATE_DELETE_TIME);
+    if (total > RESULTS_PER_PAGE_NUM) {
+      keyboard.push([{
+        text: `Page 1 of ${Math.ceil(total / RESULTS_PER_PAGE_NUM)} ➡️`,
+        callback_data: `PAGE:1:${searchId}`
+      }]);
+    }
+
+    const sent = await bot.sendMessage(chatId, header, {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: keyboard }
+    }).catch(() => null);
+    if (sent) autoDeleteMessage(bot, chatId, sent.message_id, PRIVATE_DELETE_TIME);
+
+  } catch (err) {
+    // Bug fix 1: any unexpected error is caught here — user gets feedback, bot keeps running.
+    console.error('Private search error:', err);
+    const sent = await bot.sendMessage(chatId,
+      `⚠️ <b>Something went wrong while searching.</b>\nPlease try again in a moment.`,
+      { parse_mode: 'HTML' }
+    ).catch(() => null);
+    if (sent) autoDeleteMessage(bot, chatId, sent.message_id, NO_RESULT_DELETE_TIME);
+  }
 });
 
 // ============================================================
@@ -943,9 +958,9 @@ bot.on('callback_query', async (q) => {
         return bot.sendMessage(chatId, `❌ No files found for "${suggTitle}".`);
       }
 
-      const fileIds = suggestedFiles.map(f => f.customId);
-      await cacheSearchResults(fromId, fileIds);
-      const { ids, total } = await getCachedPage(fromId, 0);
+      const fileIds  = suggestedFiles.map(f => f.customId);
+      const searchId = await cacheSearchResults(fromId, fileIds);   // Bug fix 2: unique searchId
+      const { ids, total } = await getCachedPage(fromId, searchId, 0);
       const files = await File.find({ customId: { $in: ids } }).sort({ uploaded_at: -1 }).lean();
 
       const keyboard = files.map(f => [{
@@ -953,7 +968,7 @@ bot.on('callback_query', async (q) => {
         callback_data: `GET:${f.customId}`
       }]);
       if (total > RESULTS_PER_PAGE_NUM) {
-        keyboard.push([{ text: `Page 1 of ${Math.ceil(total / RESULTS_PER_PAGE_NUM)} ➡️`, callback_data: `PAGE:1` }]);
+        keyboard.push([{ text: `Page 1 of ${Math.ceil(total / RESULTS_PER_PAGE_NUM)} ➡️`, callback_data: `PAGE:1:${searchId}` }]);
       }
 
       const sent = await bot.sendMessage(chatId, `🔍 Found <b>${total}</b> file(s) for "<i>${suggTitle}</i>":`, {
@@ -965,8 +980,13 @@ bot.on('callback_query', async (q) => {
 
     // --- PAGINATION ---
     if (data.startsWith('PAGE:')) {
-      const page = Number(data.split(':')[1]);
-      const { ids, total } = await getCachedPage(fromId, page);
+      const parts    = data.split(':');
+      const page     = Number(parts[1]);
+      const searchId = parts[2] || null;   // Bug fix 2: searchId scopes the cache lookup to this exact search session
+
+      if (!searchId) return bot.answerCallbackQuery(q.id, { text: 'Search session expired. Please search again.' });
+
+      const { ids, total } = await getCachedPage(fromId, searchId, page);
 
       if (!ids.length) return bot.answerCallbackQuery(q.id, { text: 'Search expired. Please search again.' });
 
@@ -977,8 +997,8 @@ bot.on('callback_query', async (q) => {
       }]);
 
       const nav = [];
-      if (page > 0) nav.push({ text: '⬅️ Prev', callback_data: `PAGE:${page - 1}` });
-      if ((page + 1) * RESULTS_PER_PAGE_NUM < total) nav.push({ text: 'Next ➡️', callback_data: `PAGE:${page + 1}` });
+      if (page > 0) nav.push({ text: '⬅️ Prev', callback_data: `PAGE:${page - 1}:${searchId}` });
+      if ((page + 1) * RESULTS_PER_PAGE_NUM < total) nav.push({ text: 'Next ➡️', callback_data: `PAGE:${page + 1}:${searchId}` });
       if (nav.length) keyboard.push(nav);
 
       await bot.editMessageText(
