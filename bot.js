@@ -805,6 +805,9 @@ bot.on('message', async (msg) => {
   const isGroup = msg.chat.type !== 'private';
   const text    = msg.text.trim();
 
+  // Ignore queries that are too short to be meaningful
+  if (text.length < 3) return;
+
   // Ban check
   if (await isUserBanned(fromId)) return;
 
