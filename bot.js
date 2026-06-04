@@ -883,7 +883,7 @@ bot.on('message', async (msg) => {
         noResultText += `\n\n💡 <b>Did you mean one of these?</b>`;
         const suggKeyboard = suggestions.map(s => [{
           text: `🔎 ${s.clean_title}`,
-          callback_data: `SEARCH_SUGGEST:${s.clean_title}`
+          callback_data: `SEARCH_SUGGEST:${s.customId}`  // customId is always short (e.g. F0042)
         }]);
         const sent = await bot.sendMessage(chatId, noResultText, {
           parse_mode: 'HTML',
@@ -973,7 +973,11 @@ bot.on('callback_query', async (q) => {
   try {
     // --- SEARCH SUGGESTION CLICK ---
     if (data.startsWith('SEARCH_SUGGEST:')) {
-      const suggTitle = data.slice('SEARCH_SUGGEST:'.length);
+      const suggCustomId = data.slice('SEARCH_SUGGEST:'.length);
+      // Look up the file to get the actual title for the search
+      const suggFile = await File.findOne({ customId: suggCustomId }, { clean_title: 1 }).lean();
+      if (!suggFile) return bot.answerCallbackQuery(q.id, { text: '❌ Suggestion no longer exists.', show_alert: true });
+      const suggTitle = suggFile.clean_title;
       await bot.answerCallbackQuery(q.id, { text: `Searching: ${suggTitle}` });
 
       const { files: suggestedFiles } = await searchFiles(suggTitle, 100);
