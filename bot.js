@@ -40,8 +40,8 @@ const {
   SEARCH_CACHE_DOC_TTL_DAYS = '0.001',  // Days to keep search-cache records in MongoDB (1.5 Min)
 } = process.env;
 
-if (!TELEGRAM_TOKEN || !MONGODB_URI || !STORAGE_CHANNEL_ID) {
-  console.error('❌ Error: Missing TELEGRAM_TOKEN, MONGODB_URI, or STORAGE_CHANNEL_ID in .env');
+if (!TELEGRAM_TOKEN || !MONGODB_URI || !STORAGE_CHANNEL_ID || !RENDER_EXTERNAL_URL) {
+  console.error('❌ Error: Missing one or more required env vars: TELEGRAM_TOKEN, MONGODB_URI, STORAGE_CHANNEL_ID, RENDER_EXTERNAL_URL');
   process.exit(1);
 }
 
@@ -186,14 +186,26 @@ async function nextSequence(name = 'file') {
   return 'F' + String(doc.seq).padStart(4, '0');
 }
 
-async function incrementAndGetLimit(userId) {
+// Atomically check AND increment the daily limit in a single logical operation.
+// Uses insert-or-conditional-update: tries to insert a fresh doc (first download today),
+// falls back to a conditional $inc if the doc already exists.
+// Returns true if the download is allowed, false if the daily limit is already reached.
+async function incrementIfUnderLimit(userId) {
   const today = new Date().toISOString().slice(0, 10);
-  const doc = await Limit.findOneAndUpdate(
-    { userId, date: today },
-    { $inc: { count: 1 } },
-    { upsert: true, new: true, setDefaultsOnInsert: true }
-  ).lean();
-  return doc.count;
+  try {
+    // Fast path: first download today — insert doc with count=1
+    await Limit.create({ userId, date: today, count: 1, createdAt: new Date() });
+    return true;
+  } catch (e) {
+    if (e.code !== 11000) throw e; // unexpected error — re-throw
+    // Doc already exists for today — increment only if still under limit
+    const doc = await Limit.findOneAndUpdate(
+      { userId, date: today, count: { $lt: DAILY_LIMIT_NUM } },
+      { $inc: { count: 1 } },
+      { new: true }
+    ).lean();
+    return doc !== null; // null = limit already reached
+  }
 }
 
 async function getUserLimitCount(userId) {
@@ -284,10 +296,13 @@ function formatSearchBtn(f) {
 async function deliverFile(bot, chatId, fromId, customId) {
   const file = await File.findOne({ customId }).lean();
   if (!file) return bot.sendMessage(chatId, '❌ File no longer exists.');
-  if ((await getUserLimitCount(fromId)) >= DAILY_LIMIT_NUM) {
+
+  // Atomically check AND increment in one DB operation to prevent race conditions
+  const allowed = await incrementIfUnderLimit(fromId);
+  if (!allowed) {
     return bot.sendMessage(chatId, `⚠️ Daily limit of ${DAILY_LIMIT_NUM} reached. Resets at midnight UTC.`);
   }
-  await incrementAndGetLimit(fromId);
+
   await File.updateOne({ _id: file._id }, { $inc: { downloads: 1 } });
   const sent = await bot.copyMessage(chatId, STORAGE_CHANNEL_ID, file.message_id, {
     caption:
@@ -371,8 +386,10 @@ async function getSearchSuggestions(query) {
   const qWords = query.toLowerCase().split(/\s+/).filter(w => w.length >= 2);
   if (!qWords.length) return [];
 
-  // Pull a batch of popular/recent files to mine suggestions from
-  const pool = await File.find()
+  // Only pull files that have been downloaded at least once (downloads > 0).
+  // This avoids a full collection scan — the existing downloads index makes
+  // this filter essentially free and keeps the working set small.
+  const pool = await File.find({ downloads: { $gt: 0 } })
     .select('clean_title customId')
     .sort({ downloads: -1 })
     .limit(200)
@@ -539,11 +556,12 @@ bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
     const file = await File.findOne({ customId }).lean();
     if (!file) return bot.sendMessage(chatId, '❌ File not found.');
 
-    if ((await getUserLimitCount(fromId)) >= DAILY_LIMIT_NUM) {
+    // Atomically check AND increment to prevent race conditions
+    const allowed = await incrementIfUnderLimit(fromId);
+    if (!allowed) {
       return bot.sendMessage(chatId, '⚠️ Daily limit reached. Try again tomorrow.');
     }
 
-    await incrementAndGetLimit(fromId);
     await File.updateOne({ _id: file._id }, { $inc: { downloads: 1 } });
 
     const sent = await bot.copyMessage(chatId, STORAGE_CHANNEL_ID, file.message_id, {
@@ -745,15 +763,28 @@ bot.onText(/\/broadcast(?: (.+))?/, async (msg, match) => {
   const sentMsg = await bot.sendMessage(chatId, `🚀 Broadcasting to ${users.length} users...`);
 
   for (const user of users) {
-    try {
-      if (replyMsg) {
-        await bot.copyMessage(user.userId, chatId, replyMsg.message_id);
-      } else {
-        await bot.sendMessage(user.userId, text, { parse_mode: 'HTML' });
+    let sent = false;
+    while (!sent) {
+      try {
+        if (replyMsg) {
+          await bot.copyMessage(user.userId, chatId, replyMsg.message_id);
+        } else {
+          await bot.sendMessage(user.userId, text, { parse_mode: 'HTML' });
+        }
+        success++;
+        sent = true;
+      } catch (err) {
+        if (err.response?.statusCode === 429) {
+          // Rate limited — wait the time Telegram tells us, then retry same user
+          const retryAfter = err.response?.body?.parameters?.retry_after ?? err.retryAfter ?? 5;
+          await new Promise(r => setTimeout(r, retryAfter * 1000));
+          // loop continues → retries this same user
+        } else {
+          // 403 = bot blocked by user; anything else = skip
+          if (err.response?.statusCode === 403) blocked++;
+          sent = true;
+        }
       }
-      success++;
-    } catch (err) {
-      if (err.response && err.response.statusCode === 403) blocked++;
     }
     await new Promise(r => setTimeout(r, 50));
   }
@@ -1059,12 +1090,7 @@ bot.on('callback_query', async (q) => {
       const customId  = data.split(':')[1];
       const fileCheck = await File.findOne({ customId }, { _id: 1 }).lean();
       if (!fileCheck) return bot.answerCallbackQuery(q.id, { text: '❌ File no longer exists.', show_alert: true });
-      if ((await getUserLimitCount(fromId)) >= DAILY_LIMIT_NUM) {
-        return bot.answerCallbackQuery(q.id, {
-          text: `⚠️ Daily limit of ${DAILY_LIMIT_NUM} reached. Resets at midnight UTC.`,
-          show_alert: true
-        });
-      }
+      // No pre-check here — deliverFile handles the limit atomically to prevent race conditions
       await bot.answerCallbackQuery(q.id, { text: '📤 Sending file...' });
       await deliverFile(bot, chatId, fromId, customId);
       return;
@@ -1101,8 +1127,10 @@ bot.on('callback_query', async (q) => {
 // ============================================================
 // --- GRACEFUL SHUTDOWN ---
 // ============================================================
-process.on('SIGINT', async () => {
-  console.log('Shutting down...');
+async function shutdown(signal) {
+  console.log(`${signal} received, shutting down gracefully...`);
   await mongoose.disconnect();
   process.exit(0);
-});
+}
+process.on('SIGINT',  () => shutdown('SIGINT'));   // Ctrl+C / local stop
+process.on('SIGTERM', () => shutdown('SIGTERM'));  // Render / Docker stop
