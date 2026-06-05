@@ -277,17 +277,6 @@ function formatSearchBtn(f) {
   return `${f.file_size}  |  ${f.clean_title}`;
 }
 
-// Build a two-row keyboard entry per file:
-// Row 1: the main tap-to-get button
-// Row 2: a detail label (type, size) — landscape users see this in the extra width
-// The detail row uses callback_data 'NOOP' so it looks like a label and does nothing.
-function buildFileRows(f) {
-  const type = f.type === 'video' ? '🎬 Video' : f.type === 'audio' ? '🎵 Audio' : '📄 File';
-  return [
-    [{ text: formatSearchBtn(f), callback_data: `GET:${f.customId}` }],
-    [{ text: `${type}  •  ${f.file_size}`, callback_data: 'NOOP' }]
-  ];
-}
 
 // Shared file delivery helper used by GET callback and SEARCH_SUGGEST.
 async function deliverFile(bot, chatId, fromId, customId) {
@@ -952,7 +941,7 @@ bot.on('message', async (msg) => {
       ? `🔍 Found <b>${total}</b> fuzzy match(es) for "<i>${text}</i>":`
       : `🔍 Found <b>${total}</b> file(s):`;
 
-    const keyboard = files.flatMap(f => buildFileRows(f));
+    const keyboard = files.map(f => [{ text: formatSearchBtn(f), callback_data: `GET:${f.customId}` }]);
 
     if (total > RESULTS_PER_PAGE_NUM) {
       keyboard.push([{ text: `Page 1 of ${Math.ceil(total / RESULTS_PER_PAGE_NUM)} ➡️`, callback_data: `PAGE:1:${searchId}` }]);
@@ -1018,12 +1007,6 @@ bot.on('callback_query', async (q) => {
       return;
     }
 
-    // --- NOOP (detail label buttons — do nothing) ---
-    if (data === 'NOOP') {
-      await bot.answerCallbackQuery(q.id);
-      return;
-    }
-
     // --- PAGINATION ---
     if (data.startsWith('PAGE:')) {
       const parts    = data.split(':');
@@ -1033,7 +1016,7 @@ bot.on('callback_query', async (q) => {
       const { ids, total } = await getCachedPage(fromId, searchId, page);
       if (!ids.length) return bot.answerCallbackQuery(q.id, { text: 'Search expired. Please search again.' });
       const files = await File.find({ customId: { $in: ids } }).sort({ uploaded_at: -1 }).lean();
-      const keyboard = files.flatMap(f => buildFileRows(f));
+      const keyboard = files.map(f => [{ text: formatSearchBtn(f), callback_data: `GET:${f.customId}` }]);
       const nav = [];
       if (page > 0) nav.push({ text: '⬅️ Prev', callback_data: `PAGE:${page - 1}:${searchId}` });
       if ((page + 1) * RESULTS_PER_PAGE_NUM < total) nav.push({ text: 'Next ➡️', callback_data: `PAGE:${page + 1}:${searchId}` });
