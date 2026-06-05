@@ -260,6 +260,42 @@ async function checkGroupCooldown(chatId) {
   return true;
 }
 
+// Shared file delivery helper — used by GET callback and SEARCH_SUGGEST direct delivery.
+// Checks daily limit, increments download count, copies the file to the user's chat.
+async function deliverFile(bot, chatId, fromId, customId) {
+  const file = await File.findOne({ customId }).lean();
+  if (!file) {
+    return bot.sendMessage(chatId, '❌ File no longer exists.');
+  }
+  if ((await getUserLimitCount(fromId)) >= DAILY_LIMIT_NUM) {
+    return bot.sendMessage(chatId,
+      `⚠️ Daily limit of ${DAILY_LIMIT_NUM} reached. Resets at midnight UTC.`);
+  }
+  await incrementAndGetLimit(fromId);
+  await File.updateOne({ _id: file._id }, { $inc: { downloads: 1 } });
+  const sent = await bot.copyMessage(chatId, STORAGE_CHANNEL_ID, file.message_id, {
+    caption:
+      `🎬 <b>${file.clean_title}</b>\n` +
+      `📦 Size: ${file.file_size}\n` +
+      `🎞 Type: ${file.type || 'file'}\n` +
+      `🆔 ID: <code>${file.customId}</code>\n\n` +
+      `⚠️ <i>Auto-deletes in ${PRIVATE_DELETE_TIME / 1000}s</i>`,
+    parse_mode: 'HTML',
+    reply_markup: {
+      inline_keyboard: [[{ text: '❤️ Add to Favorites', callback_data: `FAV:${file.customId}` }]]
+    }
+  });
+  autoDeleteMessage(bot, chatId, sent.message_id, PRIVATE_DELETE_TIME);
+}
+
+// Format a search result button label.
+// Telegram shows ~40–55 chars on portrait mobile, ~80+ on landscape/desktop.
+// We always include size + type so landscape users see more detail;
+// Telegram truncates gracefully on narrow screens.
+function formatSearchBtn(f) {
+  return `${f.file_size}  |  ${f.clean_title}`;
+}
+
 // Search result cache backed by MongoDB (replaces Redis search_res:*)
 // Returns a unique searchId for this session so pagination won't be broken by subsequent searches.
 async function cacheSearchResults(userId, fileIds) {
@@ -625,7 +661,7 @@ bot.onText(/\/recent/, async (msg) => {
     if (sent) autoDeleteMessage(bot, chatId, sent.message_id, GROUP_DELETE_TIME);
   } else {
     const keyboard = files.map(f => [{
-      text: `📂 ${f.file_size} | ${f.clean_title}`,
+      text: `🆕 ${f.file_size} | ${f.clean_title}`,
       callback_data: `GET:${f.customId}`
     }]);
     const sent = await bot.sendMessage(chatId, '🆕 <b>Recent Uploads:</b>', {
@@ -909,7 +945,7 @@ bot.on('message', async (msg) => {
       : `🔍 Found <b>${total}</b> file(s):`;
 
     const keyboard = files.map(f => [{
-      text: `📂 ${f.type === 'video' ? '🎬' : '📄'} ${f.clean_title} • ${f.file_size}`,
+      text: formatSearchBtn(f),
       callback_data: `GET:${f.customId}`
     }]);
 
@@ -974,34 +1010,12 @@ bot.on('callback_query', async (q) => {
     // --- SEARCH SUGGESTION CLICK ---
     if (data.startsWith('SEARCH_SUGGEST:')) {
       const suggCustomId = data.slice('SEARCH_SUGGEST:'.length);
-      // Look up the file to get the actual title for the search
-      const suggFile = await File.findOne({ customId: suggCustomId }, { clean_title: 1 }).lean();
-      if (!suggFile) return bot.answerCallbackQuery(q.id, { text: '❌ Suggestion no longer exists.', show_alert: true });
-      const suggTitle = suggFile.clean_title;
-      await bot.answerCallbackQuery(q.id, { text: `Searching: ${suggTitle}` });
-
-      const { files: suggestedFiles } = await searchFiles(suggTitle, 100);
-      if (!suggestedFiles.length) {
-        return bot.sendMessage(chatId, `❌ No files found for "${suggTitle}".`);
-      }
-
-      const fileIds  = suggestedFiles.map(f => f.customId);
-      const searchId = await cacheSearchResults(fromId, fileIds);   // Bug fix 2: unique searchId
-      const { ids, total } = await getCachedPage(fromId, searchId, 0);
-      const files = await File.find({ customId: { $in: ids } }).sort({ uploaded_at: -1 }).lean();
-
-      const keyboard = files.map(f => [{
-        text: `📂 ${f.type === 'video' ? '🎬' : '📄'} ${f.clean_title} • ${f.file_size}`,
-        callback_data: `GET:${f.customId}`
-      }]);
-      if (total > RESULTS_PER_PAGE_NUM) {
-        keyboard.push([{ text: `Page 1 of ${Math.ceil(total / RESULTS_PER_PAGE_NUM)} ➡️`, callback_data: `PAGE:1:${searchId}` }]);
-      }
-
-      const sent = await bot.sendMessage(chatId, `🔍 Found <b>${total}</b> file(s) for "<i>${suggTitle}</i>":`, {
-        parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard }
-      });
-      autoDeleteMessage(bot, chatId, sent.message_id, PRIVATE_DELETE_TIME);
+      // Directly deliver the suggested file — no second search needed.
+      const suggFile = await File.findOne({ customId: suggCustomId }).lean();
+      if (!suggFile) return bot.answerCallbackQuery(q.id, { text: '❌ File no longer exists.', show_alert: true });
+      await bot.answerCallbackQuery(q.id, { text: `📂 Sending: ${suggFile.clean_title}` });
+      // Reuse the GET delivery flow by faking a GET callback
+      await deliverFile(bot, chatId, fromId, suggCustomId);
       return;
     }
 
@@ -1019,7 +1033,7 @@ bot.on('callback_query', async (q) => {
 
       const files = await File.find({ customId: { $in: ids } }).sort({ uploaded_at: -1 }).lean();
       const keyboard = files.map(f => [{
-        text: `📂 ${f.type === 'video' ? '🎬' : '📄'} ${f.clean_title} • ${f.file_size}`,
+        text: formatSearchBtn(f),
         callback_data: `GET:${f.customId}`
       }]);
 
@@ -1043,33 +1057,16 @@ bot.on('callback_query', async (q) => {
     // --- GET FILE ---
     if (data.startsWith('GET:')) {
       const customId = data.split(':')[1];
-      const file     = await File.findOne({ customId }).lean();
-      if (!file) return bot.answerCallbackQuery(q.id, { text: '❌ File no longer exists.', show_alert: true });
-
+      const fileCheck = await File.findOne({ customId }, { _id: 1 }).lean();
+      if (!fileCheck) return bot.answerCallbackQuery(q.id, { text: '❌ File no longer exists.', show_alert: true });
       if ((await getUserLimitCount(fromId)) >= DAILY_LIMIT_NUM) {
         return bot.answerCallbackQuery(q.id, {
           text: `⚠️ Daily limit of ${DAILY_LIMIT_NUM} reached. Resets at midnight UTC.`,
           show_alert: true
         });
       }
-
       await bot.answerCallbackQuery(q.id, { text: '📤 Sending file...' });
-      await incrementAndGetLimit(fromId);
-      await File.updateOne({ _id: file._id }, { $inc: { downloads: 1 } });
-
-      const sent = await bot.copyMessage(chatId, STORAGE_CHANNEL_ID, file.message_id, {
-        caption:
-          `🎬 <b>${file.clean_title}</b>\n` +
-          `📦 Size: ${file.file_size}\n` +
-          `🎞 Type: ${file.type || 'file'}\n` +
-          `🆔 ID: <code>${file.customId}</code>\n\n` +
-          `⚠️ <i>Auto-deletes in ${PRIVATE_DELETE_TIME / 1000}s</i>`,
-        parse_mode: 'HTML',
-        reply_markup: {
-          inline_keyboard: [[{ text: '❤️ Add to Favorites', callback_data: `FAV:${file.customId}` }]]
-        }
-      });
-      autoDeleteMessage(bot, chatId, sent.message_id, PRIVATE_DELETE_TIME);
+      await deliverFile(bot, chatId, fromId, customId);
       return;
     }
 
