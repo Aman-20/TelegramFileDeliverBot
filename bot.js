@@ -66,15 +66,13 @@ try {
   });
   console.log('✅ MongoDB Connected');
 
-  // Drop any stale unique indexes on searchcaches that would cause E11000 errors.
-  // This runs once at startup and is safe to re-run on every deploy.
   try {
     const scCollection = mongoose.connection.db.collection('searchcaches');
     const indexes = await scCollection.indexes();
     for (const idx of indexes) {
       const isStaleUnique = idx.unique && (
-        (Object.keys(idx.key).length === 1 && idx.key.userId) ||   // old userId_1 index
-        (idx.key.userId && idx.key.searchId)                        // old compound unique index
+        (Object.keys(idx.key).length === 1 && idx.key.userId) ||
+        (idx.key.userId && idx.key.searchId)
       );
       if (isStaleUnique) {
         await scCollection.dropIndex(idx.name);
@@ -142,15 +140,13 @@ const MemberCacheSchema = new Schema({
 const MemberCache = mongoose.model('MemberCache', MemberCacheSchema);
 
 // Search result pages – auto-deleted after SEARCH_CACHE_DOC_TTL_DAYS day(s)
-// Each search gets a unique searchId per session so pagination is never broken by a new search.
-// NO unique indexes – avoids E11000 errors from any stale MongoDB indexes.
+// Each search gets a unique searchId. No unique index to avoid E11000 errors.
 const SearchCacheSchema = new Schema({
   userId:    { type: String, index: true },
   searchId:  { type: String, index: true },
   fileIds:   [String],
   updatedAt: { type: Date, default: Date.now, expires: Number(SEARCH_CACHE_DOC_TTL_DAYS) * 86400 }
 });
-// No unique constraint needed – searchId uniqueness is guaranteed by the random+timestamp generator.
 const SearchCache = mongoose.model('SearchCache', SearchCacheSchema);
 
 // Group cooldown – auto-deleted after 1 day (they are very short-lived anyway)
@@ -260,44 +256,7 @@ async function checkGroupCooldown(chatId) {
   return true;
 }
 
-// Shared file delivery helper — used by GET callback and SEARCH_SUGGEST direct delivery.
-// Checks daily limit, increments download count, copies the file to the user's chat.
-async function deliverFile(bot, chatId, fromId, customId) {
-  const file = await File.findOne({ customId }).lean();
-  if (!file) {
-    return bot.sendMessage(chatId, '❌ File no longer exists.');
-  }
-  if ((await getUserLimitCount(fromId)) >= DAILY_LIMIT_NUM) {
-    return bot.sendMessage(chatId,
-      `⚠️ Daily limit of ${DAILY_LIMIT_NUM} reached. Resets at midnight UTC.`);
-  }
-  await incrementAndGetLimit(fromId);
-  await File.updateOne({ _id: file._id }, { $inc: { downloads: 1 } });
-  const sent = await bot.copyMessage(chatId, STORAGE_CHANNEL_ID, file.message_id, {
-    caption:
-      `🎬 <b>${file.clean_title}</b>\n` +
-      `📦 Size: ${file.file_size}\n` +
-      `🎞 Type: ${file.type || 'file'}\n` +
-      `🆔 ID: <code>${file.customId}</code>\n\n` +
-      `⚠️ <i>Auto-deletes in ${PRIVATE_DELETE_TIME / 1000}s</i>`,
-    parse_mode: 'HTML',
-    reply_markup: {
-      inline_keyboard: [[{ text: '❤️ Add to Favorites', callback_data: `FAV:${file.customId}` }]]
-    }
-  });
-  autoDeleteMessage(bot, chatId, sent.message_id, PRIVATE_DELETE_TIME);
-}
-
-// Format a search result button label.
-// Telegram shows ~40–55 chars on portrait mobile, ~80+ on landscape/desktop.
-// We always include size + type so landscape users see more detail;
-// Telegram truncates gracefully on narrow screens.
-function formatSearchBtn(f) {
-  return `${f.file_size}  |  ${f.clean_title}`;
-}
-
-// Search result cache backed by MongoDB (replaces Redis search_res:*)
-// Returns a unique searchId for this session so pagination won't be broken by subsequent searches.
+// Search result cache — returns a unique searchId per session.
 async function cacheSearchResults(userId, fileIds) {
   const searchId = Math.random().toString(36).slice(2) + Date.now().toString(36);
   await SearchCache.create({ userId, searchId, fileIds, updatedAt: new Date() });
@@ -311,6 +270,33 @@ async function getCachedPage(userId, searchId, page) {
   const start = page * RESULTS_PER_PAGE_NUM;
   const ids = doc.fileIds.slice(start, start + RESULTS_PER_PAGE_NUM);
   return { ids, total };
+}
+
+// Format search result button: size | title (no icon, size first for mobile)
+function formatSearchBtn(f) {
+  return `${f.file_size}  |  ${f.clean_title}`;
+}
+
+// Shared file delivery helper used by GET callback and SEARCH_SUGGEST.
+async function deliverFile(bot, chatId, fromId, customId) {
+  const file = await File.findOne({ customId }).lean();
+  if (!file) return bot.sendMessage(chatId, '❌ File no longer exists.');
+  if ((await getUserLimitCount(fromId)) >= DAILY_LIMIT_NUM) {
+    return bot.sendMessage(chatId, `⚠️ Daily limit of ${DAILY_LIMIT_NUM} reached. Resets at midnight UTC.`);
+  }
+  await incrementAndGetLimit(fromId);
+  await File.updateOne({ _id: file._id }, { $inc: { downloads: 1 } });
+  const sent = await bot.copyMessage(chatId, STORAGE_CHANNEL_ID, file.message_id, {
+    caption:
+      `🎬 <b>${file.clean_title}</b>\n` +
+      `📦 Size: ${file.file_size}\n` +
+      `🎞 Type: ${file.type || 'file'}\n` +
+      `🆔 ID: <code>${file.customId}</code>\n\n` +
+      `⚠️ <i>Auto-deletes in ${PRIVATE_DELETE_TIME / 1000}s</i>`,
+    parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: [[{ text: '❤️ Add to Favorites', callback_data: `FAV:${file.customId}` }]] }
+  });
+  autoDeleteMessage(bot, chatId, sent.message_id, PRIVATE_DELETE_TIME);
 }
 
 function cleanFileName(text) {
@@ -578,7 +564,17 @@ bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
 
 // 2. /help
 bot.onText(/\/help/, async (msg) => {
-  if (msg.chat.type !== 'private') return;
+  if (msg.chat.type !== 'private') {
+    const sent = await bot.sendMessage(msg.chat.id,
+      `ℹ️ <b>Help:</b> Type a movie/show name to search.\nTap below for full commands.`,
+      {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '📖 Full Help', url: `https://t.me/${BOT_USERNAME}?start=help` }]] }
+      }
+    ).catch(() => null);
+    if (sent) autoDeleteMessage(bot, msg.chat.id, sent.message_id, 30000);
+    return;
+  }
 
   const isAdmin = ADMIN_SET.has(String(msg.from.id));
   let text =
@@ -661,7 +657,7 @@ bot.onText(/\/recent/, async (msg) => {
     if (sent) autoDeleteMessage(bot, chatId, sent.message_id, GROUP_DELETE_TIME);
   } else {
     const keyboard = files.map(f => [{
-      text: `🆕 ${f.file_size} | ${f.clean_title}`,
+      text: `📂 ${f.file_size} | ${f.clean_title}`,
       callback_data: `GET:${f.customId}`
     }]);
     const sent = await bot.sendMessage(chatId, '🆕 <b>Recent Uploads:</b>', {
@@ -861,7 +857,7 @@ bot.on('message', async (msg) => {
   const isGroup = msg.chat.type !== 'private';
   const text    = msg.text.trim();
 
-  // Ignore queries that are too short to be meaningful
+  // Ignore queries shorter than 3 characters
   if (text.length < 3) return;
 
   // Ban check
@@ -906,8 +902,6 @@ bot.on('message', async (msg) => {
   await saveUser(msg);
   if (!await verifyJoin(chatId, fromId)) return;
 
-  // Bug fix 1: wrap entire search in try/catch so any DB or search error
-  // sends a user-facing message instead of silently killing the handler.
   try {
     const { files: allMatches, isFuzzy } = await searchFiles(text, 100);
 
@@ -919,7 +913,7 @@ bot.on('message', async (msg) => {
         noResultText += `\n\n💡 <b>Did you mean one of these?</b>`;
         const suggKeyboard = suggestions.map(s => [{
           text: `🔎 ${s.clean_title}`,
-          callback_data: `SEARCH_SUGGEST:${s.customId}`  // customId is always short (e.g. F0042)
+          callback_data: `SEARCH_SUGGEST:${s.customId}`
         }]);
         const sent = await bot.sendMessage(chatId, noResultText, {
           parse_mode: 'HTML',
@@ -932,16 +926,13 @@ bot.on('message', async (msg) => {
       return autoDeleteMessage(bot, chatId, sent.message_id, NO_RESULT_DELETE_TIME);
     }
 
-    const fileIds = allMatches.map(f => f.customId);
-    // Bug fix 2: cacheSearchResults now returns a unique searchId per search session,
-    // so a new search never overwrites the cache of an in-progress pagination session.
+    const fileIds  = allMatches.map(f => f.customId);
     const searchId = await cacheSearchResults(fromId, fileIds);
-
     const { ids, total } = await getCachedPage(fromId, searchId, 0);
     const files = await File.find({ customId: { $in: ids } }).sort({ uploaded_at: -1 }).lean();
 
     const header = isFuzzy
-      ? `🔍 Found <b>${total}</b> fuzzy match(es) for "<i>${text}</i>":` 
+      ? `🔍 Found <b>${total}</b> fuzzy match(es) for "<i>${text}</i>":`
       : `🔍 Found <b>${total}</b> file(s):`;
 
     const keyboard = files.map(f => [{
@@ -950,10 +941,7 @@ bot.on('message', async (msg) => {
     }]);
 
     if (total > RESULTS_PER_PAGE_NUM) {
-      keyboard.push([{
-        text: `Page 1 of ${Math.ceil(total / RESULTS_PER_PAGE_NUM)} ➡️`,
-        callback_data: `PAGE:1:${searchId}`
-      }]);
+      keyboard.push([{ text: `Page 1 of ${Math.ceil(total / RESULTS_PER_PAGE_NUM)} ➡️`, callback_data: `PAGE:1:${searchId}` }]);
     }
 
     const sent = await bot.sendMessage(chatId, header, {
@@ -963,7 +951,6 @@ bot.on('message', async (msg) => {
     if (sent) autoDeleteMessage(bot, chatId, sent.message_id, PRIVATE_DELETE_TIME);
 
   } catch (err) {
-    // Bug fix 1: any unexpected error is caught here — user gets feedback, bot keeps running.
     console.error('Private search error:', err);
     const sent = await bot.sendMessage(chatId,
       `⚠️ <b>Something went wrong while searching.</b>\nPlease try again in a moment.`,
@@ -1007,14 +994,12 @@ bot.on('callback_query', async (q) => {
   }
 
   try {
-    // --- SEARCH SUGGESTION CLICK ---
+    // --- SEARCH SUGGESTION CLICK — directly deliver the file, no re-search ---
     if (data.startsWith('SEARCH_SUGGEST:')) {
       const suggCustomId = data.slice('SEARCH_SUGGEST:'.length);
-      // Directly deliver the suggested file — no second search needed.
-      const suggFile = await File.findOne({ customId: suggCustomId }).lean();
+      const suggFile = await File.findOne({ customId: suggCustomId }, { clean_title: 1 }).lean();
       if (!suggFile) return bot.answerCallbackQuery(q.id, { text: '❌ File no longer exists.', show_alert: true });
       await bot.answerCallbackQuery(q.id, { text: `📂 Sending: ${suggFile.clean_title}` });
-      // Reuse the GET delivery flow by faking a GET callback
       await deliverFile(bot, chatId, fromId, suggCustomId);
       return;
     }
@@ -1023,40 +1008,26 @@ bot.on('callback_query', async (q) => {
     if (data.startsWith('PAGE:')) {
       const parts    = data.split(':');
       const page     = Number(parts[1]);
-      const searchId = parts[2] || null;   // Bug fix 2: searchId scopes the cache lookup to this exact search session
-
+      const searchId = parts[2] || null;
       if (!searchId) return bot.answerCallbackQuery(q.id, { text: 'Search session expired. Please search again.' });
-
       const { ids, total } = await getCachedPage(fromId, searchId, page);
-
       if (!ids.length) return bot.answerCallbackQuery(q.id, { text: 'Search expired. Please search again.' });
-
       const files = await File.find({ customId: { $in: ids } }).sort({ uploaded_at: -1 }).lean();
-      const keyboard = files.map(f => [{
-        text: formatSearchBtn(f),
-        callback_data: `GET:${f.customId}`
-      }]);
-
+      const keyboard = files.map(f => [{ text: formatSearchBtn(f), callback_data: `GET:${f.customId}` }]);
       const nav = [];
       if (page > 0) nav.push({ text: '⬅️ Prev', callback_data: `PAGE:${page - 1}:${searchId}` });
       if ((page + 1) * RESULTS_PER_PAGE_NUM < total) nav.push({ text: 'Next ➡️', callback_data: `PAGE:${page + 1}:${searchId}` });
       if (nav.length) keyboard.push(nav);
-
       await bot.editMessageText(
         `🔍 Results — Page <b>${page + 1}</b> of <b>${Math.ceil(total / RESULTS_PER_PAGE_NUM)}</b>`,
-        {
-          chat_id: chatId,
-          message_id: q.message.message_id,
-          parse_mode: 'HTML',
-          reply_markup: { inline_keyboard: keyboard }
-        }
+        { chat_id: chatId, message_id: q.message.message_id, parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } }
       );
       return;
     }
 
     // --- GET FILE ---
     if (data.startsWith('GET:')) {
-      const customId = data.split(':')[1];
+      const customId  = data.split(':')[1];
       const fileCheck = await File.findOne({ customId }, { _id: 1 }).lean();
       if (!fileCheck) return bot.answerCallbackQuery(q.id, { text: '❌ File no longer exists.', show_alert: true });
       if ((await getUserLimitCount(fromId)) >= DAILY_LIMIT_NUM) {
