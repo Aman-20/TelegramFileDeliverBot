@@ -5,6 +5,14 @@ import TelegramBot from 'node-telegram-bot-api';
 import mongoose from 'mongoose';
 import express from 'express';
 
+// Unexcepted Error Handles
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled rejection:', err);
+});
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err);
+});
+
 // ============================================================
 // --- CONFIGURATION (All limits from .env) ---
 // ============================================================
@@ -20,21 +28,16 @@ const {
   STORAGE_CHANNEL_ID,
   FAV_LIMIT = '50',
   PRIVATE_AUTO_DELETE_MS = '60000',
-  GROUP_AUTO_DELETE_MS = '30000',
-  GROUP_COOLDOWN_MS = '10000',
-
-  // MEMBER_CACHE_TTL_MS = '300000',     // How long to remember a verified member (default 5 min)
-  // SEARCH_CACHE_TTL_MS = '600000',     // How long to keep search result pages (default 10 min)
-  
-  NO_RESULT_DELETE_MS = '8000',       // How long "no results" message stays
+  GROUP_AUTO_DELETE_MS = '60000',
+  GROUP_COOLDOWN_MS = '2000',
+  NO_RESULT_DELETE_MS = '60000',       // How long "no results" message stays
   TRENDING_LIMIT = '10',              // How many files shown in /trending
   RECENT_LIMIT = '10',               // How many files shown in /recent
-  GROUP_SEARCH_LIMIT = '5',          // Max inline results in group search
   FUZZY_MIN_WORD_LEN = '3',          // Min word length for fuzzy fallback
   SUGGESTION_LIMIT = '5',            // Max suggestions shown when no results found
   LIMIT_DOC_TTL_DAYS = '2',         // Days to keep daily-limit records in MongoDB
   MEMBER_DOC_TTL_DAYS = '7',        // Days to keep member-cache records in MongoDB
-  SEARCH_CACHE_DOC_TTL_DAYS = '1',  // Days to keep search-cache records in MongoDB
+  SEARCH_CACHE_DOC_TTL_DAYS = '0.001',  // Days to keep search-cache records in MongoDB (1.5 Min)
 } = process.env;
 
 if (!TELEGRAM_TOKEN || !MONGODB_URI || !STORAGE_CHANNEL_ID) {
@@ -53,7 +56,6 @@ const GROUP_COOLDOWN_TIME     = Number(GROUP_COOLDOWN_MS);
 const NO_RESULT_DELETE_TIME   = Number(NO_RESULT_DELETE_MS);
 const TRENDING_LIMIT_NUM      = Number(TRENDING_LIMIT);
 const RECENT_LIMIT_NUM        = Number(RECENT_LIMIT);
-const GROUP_SEARCH_LIMIT_NUM  = Number(GROUP_SEARCH_LIMIT);
 const FUZZY_MIN_LEN           = Number(FUZZY_MIN_WORD_LEN);
 const SUGGESTION_LIMIT_NUM    = Number(SUGGESTION_LIMIT);
 
