@@ -1,107 +1,261 @@
-# 📂 Telegram File Store Bot
+# 🎬 Telegram File Search Bot
 
-A professional, high-performance Telegram bot for indexing, searching, and delivering files securely. It supports **Force Join**, **Group Search Previews**, **Admin Broadcasts**, and **MongoDB/Redis** caching for speed.
-
-## 🚀 Features
-
-* **Private File Storage:** Files are stored in a private channel; users never see the source.
-* **Smart Search:** Fast keyword search with Redis caching and pagination.
-* **Group Support:** Works in groups with "Preview Mode" (redirects users to DM for delivery).
-* **Force Join:** Forces users to join a specific channel before accessing files.
-* **Deep Linking:** Auto-delivers files after a user joins the channel.
-* **Admin Controls:** Broadcast messages, view stats, and delete files.
-* **Anti-Spam:** Rate limits, auto-delete timers, and cooldowns for groups.
+A production-ready Telegram bot that indexes files from a private storage channel and lets users search and download them — with fuzzy search, daily limits, favorites, group support, and admin tools. Built with Node.js, MongoDB, and deployed on Render.
 
 ---
 
-## 🛠️ Installation
+## ✨ Features
+
+### For Users
+- 🔎 **Smart Search** — Exact keyword match with automatic fuzzy fallback
+- 💡 **Search Suggestions** — Shows similar titles when nothing is found
+- 📄 **Paginated Results** — Browse results page by page
+- ❤️ **Favorites** — Save up to 50 files for quick access
+- 📈 **Trending** — See the most downloaded files
+- 🆕 **Recent** — Browse the latest uploads
+- 👤 **My Account** — Check daily download usage
+- ⏱️ **Auto-Delete** — Messages auto-delete to keep chats clean
+- 🔗 **Deep Links** — Share direct file links (works in groups too)
+
+### For Groups
+- Group members can search directly in the chat
+- Results send a private DM link — files are never posted publicly
+- Per-group cooldown to prevent spam
+
+### For Admins
+- 📊 `/stats` — Total users, files, and banned count
+- 📢 `/broadcast` — Send a message or forward any content to all users
+- 🗑️ `/delete [ID]` — Remove a file from the index
+- 🚫 `/ban [userId]` — Ban a user
+- ✅ `/unban [userId]` — Unban a user
+
+### Indexing
+- Files posted to the storage channel are **automatically indexed**
+- Caption is updated with the assigned file ID after indexing
+- Supports `video` and `document` type files
+
+---
+
+## 🛠️ Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Runtime | Node.js (ESM, `type: "module"`) |
+| Telegram | `node-telegram-bot-api` (webhook mode) |
+| Database | MongoDB via Mongoose |
+| Server | Express.js |
+| Hosting | Render (Web Service) |
+
+---
+
+## 📁 Project Structure
+
+```
+.
+├── bot.js          # Main bot file (single-file architecture)
+├── .env            # Environment variables
+├── package.json
+└── README.md
+```
+
+---
+
+## ⚙️ Environment Variables
+
+Create a `.env` file in the root directory. All variables marked **required** must be set or the bot will refuse to start.
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `TELEGRAM_TOKEN` | ✅ | — | Bot token from [@BotFather](https://t.me/BotFather) |
+| `MONGODB_URI` | ✅ | — | MongoDB connection string |
+| `STORAGE_CHANNEL_ID` | ✅ | — | Channel ID where files are stored (e.g. `-100xxxxxxxxxx`) |
+| `RENDER_EXTERNAL_URL` | ✅ | — | Your Render app URL (e.g. `https://your-app.onrender.com`) |
+| `ADMIN_IDS` | ⚠️ | `''` | Comma-separated Telegram user IDs with admin access |
+| `FORCE_CHANNEL_ID` | ⚠️ | — | Channel ID or `@username` users must join before using the bot |
+| `DAILY_LIMIT` | ➖ | `100` | Max downloads per user per day |
+| `RESULTS_PER_PAGE` | ➖ | `10` | Search results shown per page |
+| `FAV_LIMIT` | ➖ | `50` | Max favorites per user |
+| `PRIVATE_AUTO_DELETE_MS` | ➖ | `60000` | How long (ms) private messages stay before auto-delete |
+| `GROUP_AUTO_DELETE_MS` | ➖ | `60000` | How long (ms) group messages stay before auto-delete |
+| `GROUP_COOLDOWN_MS` | ➖ | `2000` | Cooldown (ms) between searches in the same group |
+| `NO_RESULT_DELETE_MS` | ➖ | `60000` | How long (ms) "no results" messages stay |
+| `TRENDING_LIMIT` | ➖ | `10` | Number of files shown in `/trending` |
+| `RECENT_LIMIT` | ➖ | `10` | Number of files shown in `/recent` |
+| `FUZZY_MIN_WORD_LEN` | ➖ | `3` | Minimum word length for fuzzy search fallback |
+| `SUGGESTION_LIMIT` | ➖ | `5` | Max suggestions shown when no results found |
+| `LIMIT_DOC_TTL_DAYS` | ➖ | `2` | Days to keep daily-limit records in MongoDB |
+| `MEMBER_DOC_TTL_DAYS` | ➖ | `7` | Days to cache channel membership checks |
+| `SEARCH_CACHE_DOC_TTL_DAYS` | ➖ | `0.001` | Days to keep search result cache (~1.5 min) |
+
+### `.env.example`
+
+```env
+# Required
+TELEGRAM_TOKEN=your_bot_token_here
+MONGODB_URI=mongodb+srv://user:pass@cluster.mongodb.net/
+STORAGE_CHANNEL_ID=-100xxxxxxxxxx
+RENDER_EXTERNAL_URL=https://your-app.onrender.com
+
+# Recommended
+ADMIN_IDS=123456789,987654321
+FORCE_CHANNEL_ID=@your_channel
+
+# Optional (defaults shown)
+DAILY_LIMIT=100
+RESULTS_PER_PAGE=10
+FAV_LIMIT=50
+PRIVATE_AUTO_DELETE_MS=60000
+GROUP_AUTO_DELETE_MS=60000
+GROUP_COOLDOWN_MS=2000
+NO_RESULT_DELETE_MS=60000
+TRENDING_LIMIT=10
+RECENT_LIMIT=10
+FUZZY_MIN_WORD_LEN=3
+SUGGESTION_LIMIT=5
+LIMIT_DOC_TTL_DAYS=2
+MEMBER_DOC_TTL_DAYS=7
+SEARCH_CACHE_DOC_TTL_DAYS=0.001
+```
+
+---
+
+## 🚀 Deployment on Render
 
 ### 1. Prerequisites
-* Node.js (v16 or higher)
-* MongoDB Database (Atlas or Local)
-* Redis Database (for caching)
+- A [Render](https://render.com) account
+- A MongoDB database (e.g. [MongoDB Atlas](https://www.mongodb.com/atlas) free tier)
+- A Telegram bot token from [@BotFather](https://t.me/BotFather)
+- A **private** Telegram channel for file storage where the bot is an admin
 
-### 2. Setup
-1.  **Clone the project:**
-    ```bash
-    git clone [https://github.com/Aman-20/TelegramFileDeliverBot.git](https://github.com/Aman-20/TelegramFileDeliverBot.git)
-    cd telegram-file-bot
-    ```
+### 2. Setup the Storage Channel
+1. Create a private Telegram channel
+2. Add your bot as an **Administrator** with permission to post messages and edit messages
+3. Get the channel ID by forwarding a message from it to [@userinfobot](https://t.me/userinfobot)
 
-2.  **Install dependencies:**
-    ```bash
-    npm install node-telegram-bot-api mongoose ioredis dotenv express
-    ```
+### 3. Deploy to Render
+1. Push this repo to GitHub
+2. Go to [Render Dashboard](https://dashboard.render.com) → **New Web Service**
+3. Connect your GitHub repo
+4. Configure the service:
+   - **Environment**: `Node`
+   - **Build Command**: `npm install`
+   - **Start Command**: `node bot.js`
+5. Add all environment variables from the table above under **Environment**
+6. Set `RENDER_EXTERNAL_URL` to your Render app's URL (visible after first deploy)
+7. Click **Deploy**
 
-3.  **Configure Environment:**
-    Create a `.env` file in the root directory and fill in the details (see below).
-
-4.  **Run the bot:**
-    ```bash
-    node bot.js
-    ```
-
----
-
-## ⚙️ Configuration (.env)
-
-| Variable | Description |
-| :--- | :--- |
-| `TELEGRAM_TOKEN` | Your Bot Token from @BotFather |
-| `MONGODB_URI` | Your MongoDB Connection String |
-| `REDIS_URL` | Your Redis Connection String (e.g., redis://user:pass@host:port) |
-| `ADMIN_IDS` | Comma-separated Admin IDs (e.g., `12345,67890`) |
-| `STORAGE_CHANNEL_ID` | ID of the Private Channel where you upload files (e.g., `-100...`) |
-| `FORCE_CHANNEL_ID` | ID of the Channel users MUST join (e.g., `-100...` or `@channel`) |
-| `DAILY_LIMIT` | Max downloads per user per day (Default: 100) |
-| `FAV_LIMIT` | Max favorites per user (Default: 50) |
-| `RENDER_EXTERNAL_URL` | (Optional) URL for Webhook if using Render/Heroku |
+### 4. Verify
+After deploy, check the Render logs for:
+```
+✅ MongoDB Connected
+✅ Bot @your_bot_username ready
+✅ Server on port 3000
+```
 
 ---
 
-## 📖 Usage Guide
+## 🏃 Running Locally
 
-### 📤 How to Upload Files
-1.  Add the bot as an **Admin** to your **Storage Channel**.
-2.  Simply **upload** or **forward** a file (Video/Document) to that channel.
-3.  The bot will automatically index it and edit the caption with an ID (e.g., `Indexed: F0001`).
+```bash
+# 1. Clone the repo
+git clone https://github.com/Aman-20/TelegramFileDeliverBot.git
+cd your-repo
 
-### 🔎 How Users Search
-* **Private Chat:** Type any movie name. The bot returns a paginated list.
-* **Group Chat:** Type a movie name. The bot shows a "Preview" button. Clicking it takes the user to the bot to download the file securely.
+# 2. Install dependencies
+npm install
 
-### 👮‍♂️ Admin Commands
-* `/broadcast [message]` - Send a message to all bot users.
-* `/broadcast` (Reply to message) - Forward the replied message to all users.
-* `/stats` - (Custom implementation required if needed).
+# 3. Set up environment variables
+cp .env.example .env
+# Edit .env with your values
 
-### 👤 For Users
-* **Search:** Just type the name of the movie (e.g., "Iron Man").
-* **Commands:**
-    * `/start` - Welcome menu
-    * `/recent` - See newly uploaded files
-    * `/trending` - See most popular files
-    * `/favorites` - View saved files
-    * `/myaccount` - Check daily download limit
+# 4. Run the bot
+node bot.js
+```
+
+> **Note:** Local mode requires a public webhook URL. Use a tunneling tool like [ngrok](https://ngrok.com) and set `RENDER_EXTERNAL_URL` to your ngrok URL.
 
 ---
 
-## ☁️ Deployment (Render.com)
+## 📋 User Commands
 
-This bot is optimized for **Render** using Webhooks.
+| Command | Description |
+|---|---|
+| `/start` | Welcome message / re-authenticate |
+| `/help` | Full command guide |
+| `/trending` | Most downloaded files |
+| `/recent` | Latest uploaded files |
+| `/favorites` | Your saved files |
+| `/myaccount` | Check your daily download usage |
 
-1.  Create a new **Web Service** on Render.
-2.  Connect your GitHub repository.
-3.  Add the **Environment Variables** listed above in the Render dashboard.
-4.  **Important:** Ensure `RENDER_EXTERNAL_URL` matches your Render app's URL (e.g., `https://your-bot-name.onrender.com`).
-5.  Deploy! 🚀
+## 🔐 Admin Commands
+
+| Command | Description |
+|---|---|
+| `/stats` | Bot statistics (users, files, banned) |
+| `/broadcast <message>` | Send a message to all users |
+| `/broadcast` *(reply to msg)* | Forward any message to all users |
+| `/delete <FILE_ID>` | Remove a file from the index |
+| `/ban <userId>` | Ban a user from the bot |
+| `/unban <userId>` | Unban a user |
 
 ---
 
-## 🤝 Contributing
+## 🗄️ Database Collections
 
-Contributions, issues, and feature requests are welcome! Feel free to fork this repository and submit a pull request.
+| Collection | TTL | Purpose |
+|---|---|---|
+| `users` | Never | User profiles and ban status |
+| `files` | Never | Indexed file metadata |
+| `counters` | Never | Auto-increment sequence for file IDs |
+| `limits` | `LIMIT_DOC_TTL_DAYS` | Daily download counts per user |
+| `membercaches` | `MEMBER_DOC_TTL_DAYS` | Channel membership verification cache |
+| `searchcaches` | `SEARCH_CACHE_DOC_TTL_DAYS` | Paginated search result sessions |
+| `groupcooldowns` | 1 day | Per-group search cooldown tracking |
+| `favorites` | Never | User-saved file references |
 
-## 📝 License
+---
 
-This project is licensed under the MIT License.
+## 🔍 How Search Works
+
+1. **Exact match** — Splits query into keywords and looks for files whose `attributes` array contains all of them (`$all`). Fast and precise.
+2. **Fuzzy fallback** — If nothing is found, runs a partial `$regex` match on each word ≥ `FUZZY_MIN_WORD_LEN` characters. Catches typos and partial titles.
+3. **Suggestions** — If both fail, scores the top 200 most-downloaded files by word overlap with the query and shows the best matches.
+
+---
+
+## 📦 `package.json`
+
+Make sure your `package.json` includes `"type": "module"` since the bot uses ES module syntax (`import`/`export`):
+
+```json
+{
+  "name": "telegram-file-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.0.0",
+    "express": "^4.18.0",
+    "mongoose": "^8.0.0",
+    "node-telegram-bot-api": "^0.64.0"
+  }
+}
+```
+
+---
+
+## ⚠️ Important Notes
+
+- The bot must be an **admin** in the storage channel to index files and generate invite links.
+- If `FORCE_CHANNEL_ID` is set, the bot must also be an admin in that channel to verify membership.
+- Daily limits reset at **midnight UTC**.
+- File IDs are sequential in format `F0001`, `F0002`, etc.
+
+---
+
+## 📄 License
+
+MIT — feel free to use, modify, and distribute.
