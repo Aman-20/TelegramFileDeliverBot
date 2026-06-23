@@ -70,7 +70,7 @@ Create a `.env` file in the root directory. All variables marked **required** mu
 | `MONGODB_URI` | ✅ | — | MongoDB connection string |
 | `STORAGE_CHANNEL_ID` | ✅ | — | Channel ID where files are stored (e.g. `-100xxxxxxxxxx`) |
 | `RENDER_EXTERNAL_URL` | ✅ | — | Your Render app URL (e.g. `https://your-app.onrender.com`) |
-| `ADMIN_IDS` | ⚠️ | `''` | Comma-separated Telegram user IDs with admin access |
+| `ADMIN_IDS` | ✅ | `''` | Comma-separated Telegram user IDs with admin access |
 | `FORCE_CHANNEL_ID` | ⚠️ | — | Channel ID or `@username` users must join before using the bot |
 | `DAILY_LIMIT` | ➖ | `100` | Max downloads per user per day |
 | `RESULTS_PER_PAGE` | ➖ | `10` | Search results shown per page |
@@ -259,3 +259,7 @@ Make sure your `package.json` includes `"type": "module"` since the bot uses ES 
 ## 📄 License
 
 MIT — feel free to use, modify, and distribute.
+
+---
+
+**Made with ❤️ by Aman**
