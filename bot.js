@@ -397,7 +397,7 @@ async function verifyJoin(bot, chatId, userId, fileCode = null) {
       return true;
     }
 
-    let channelLink = 'https://t.me/';
+    let channelLink = `https://t.me/${FORCE_CHANNEL_ID}`;
     if (FORCE_CHANNEL_ID.startsWith('@')) {
       channelLink = `https://t.me/${FORCE_CHANNEL_ID.replace('@', '')}`;
     } else {
