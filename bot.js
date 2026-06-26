@@ -5,16 +5,14 @@ import TelegramBot from 'node-telegram-bot-api';
 import mongoose from 'mongoose';
 import express from 'express';
 
-// Unexcepted Error Handles
-process.on('unhandledRejection', (err) => {
-  console.error('Unhandled rejection:', err);
-});
-process.on('uncaughtException', (err) => {
-  console.error('Uncaught exception:', err);
-});
+// ============================================================
+// --- GLOBAL ERROR HANDLERS ---
+// ============================================================
+process.on('unhandledRejection', (err) => console.error('Unhandled rejection:', err));
+process.on('uncaughtException', (err) => console.error('Uncaught exception:', err));
 
 // ============================================================
-// --- CONFIGURATION (All limits from .env) ---
+// --- CONFIGURATION ---
 // ============================================================
 const {
   TELEGRAM_TOKEN,
@@ -30,23 +28,20 @@ const {
   PRIVATE_AUTO_DELETE_MS = '60000',
   GROUP_AUTO_DELETE_MS = '60000',
   GROUP_COOLDOWN_MS = '2000',
-  NO_RESULT_DELETE_MS = '60000',       // How long "no results" message stays
-  TRENDING_LIMIT = '10',              // How many files shown in /trending
-  RECENT_LIMIT = '10',               // How many files shown in /recent
-  FUZZY_MIN_WORD_LEN = '3',          // Min word length for fuzzy fallback
-  SUGGESTION_LIMIT = '5',            // Max suggestions shown when no results found
-  LIMIT_DOC_TTL_DAYS = '2',         // Days to keep daily-limit records in MongoDB
-  MEMBER_DOC_TTL_DAYS = '7',        // Days to keep member-cache records in MongoDB
-  SEARCH_CACHE_DOC_TTL_DAYS = '0.001',  // Days to keep search-cache records in MongoDB (1.5 Min)
+  NO_RESULT_DELETE_MS = '60000',
+  TRENDING_LIMIT = '10',
+  RECENT_LIMIT = '10',
+  FUZZY_MIN_WORD_LEN = '3',
+  LIMIT_DOC_TTL_DAYS = '2',
 } = process.env;
 
 if (!TELEGRAM_TOKEN || !MONGODB_URI || !STORAGE_CHANNEL_ID || !RENDER_EXTERNAL_URL) {
-  console.error('❌ Error: Missing one or more required env vars: TELEGRAM_TOKEN, MONGODB_URI, STORAGE_CHANNEL_ID, RENDER_EXTERNAL_URL');
+  console.error('❌ Error: Missing required env vars: TELEGRAM_TOKEN, MONGODB_URI, STORAGE_CHANNEL_ID, RENDER_EXTERNAL_URL');
   process.exit(1);
 }
 
 const ADMIN_SET               = new Set(ADMIN_IDS.split(',').map(s => s.trim()).filter(Boolean));
-const STORAGE_CHANNEL_ID_STR  = String(STORAGE_CHANNEL_ID); // normalized for consistent string comparisons
+const STORAGE_CHANNEL_ID_STR  = String(STORAGE_CHANNEL_ID);
 const DAILY_LIMIT_NUM         = Number(DAILY_LIMIT);
 const RESULTS_PER_PAGE_NUM    = Number(RESULTS_PER_PAGE);
 const FAV_LIMIT_NUM           = Number(FAV_LIMIT);
@@ -57,55 +52,101 @@ const NO_RESULT_DELETE_TIME   = Number(NO_RESULT_DELETE_MS);
 const TRENDING_LIMIT_NUM      = Number(TRENDING_LIMIT);
 const RECENT_LIMIT_NUM        = Number(RECENT_LIMIT);
 const FUZZY_MIN_LEN           = Number(FUZZY_MIN_WORD_LEN);
-const SUGGESTION_LIMIT_NUM    = Number(SUGGESTION_LIMIT);
 
 // ============================================================
-// --- DATABASE CONNECT ---
+// --- IN-MEMORY CACHES (replaces MongoDB temp collections) ---
+// ============================================================
+
+// Generic TTL cache entry: { value, expiresAt }
+class TTLCache {
+  constructor(ttlMs) {
+    this._map = new Map();
+    this._ttl = ttlMs;
+    // Periodic sweep to avoid unbounded memory growth (~every 5 min)
+    setInterval(() => this._sweep(), 5 * 60 * 1000).unref();
+  }
+  get(key) {
+    const entry = this._map.get(key);
+    if (!entry) return undefined;
+    if (Date.now() > entry.expiresAt) { this._map.delete(key); return undefined; }
+    return entry.value;
+  }
+  set(key, value) {
+    this._map.set(key, { value, expiresAt: Date.now() + this._ttl });
+  }
+  delete(key) { this._map.delete(key); }
+  _sweep() {
+    const now = Date.now();
+    for (const [k, e] of this._map) if (now > e.expiresAt) this._map.delete(k);
+  }
+}
+
+// Ban cache — 5 min TTL
+const banCache = new TTLCache(5 * 60 * 1000);
+
+// Member join cache — 15 min TTL
+const memberCache = new TTLCache(15 * 60 * 1000);
+
+// Group cooldown — 2 s TTL (keyed by chatId)
+const groupCooldownCache = new TTLCache(GROUP_COOLDOWN_TIME);
+
+// Search result cache — 5 min TTL
+// key: `${userId}:${searchId}` → fileIds array
+const searchResultCache = new TTLCache(5 * 60 * 1000);
+
+// Deletion scheduler — centralized, avoids leaking timer references
+const pendingDeletions = new Map(); // `${chatId}:${messageId}` → timer id
+
+function scheduleDelete(bot, chatId, messageId, delayMs) {
+  const key = `${chatId}:${messageId}`;
+  if (pendingDeletions.has(key)) return; // already scheduled
+  const t = setTimeout(async () => {
+    pendingDeletions.delete(key);
+    try {
+      await bot.deleteMessage(chatId, messageId);
+    } catch (e) {
+      // Ignore "message not found" (400/404) — already deleted or never existed
+      if (!e.message?.includes('message to delete not found') &&
+          !e.message?.includes('message can\'t be deleted')) {
+        console.warn('Delete error (non-fatal):', e.message);
+      }
+    }
+  }, delayMs);
+  pendingDeletions.set(key, t);
+}
+
+// ============================================================
+// --- DATABASE ---
 // ============================================================
 try {
   await mongoose.connect(MONGODB_URI, {
-    dbName: 'TelegramMovies'
+    dbName: 'TelegramMovies',
+    maxPoolSize: 10,
+    minPoolSize: 2,
+    serverSelectionTimeoutMS: 5000,
+    socketTimeoutMS: 45000,
   });
   console.log('✅ MongoDB Connected');
-
-  try {
-    const scCollection = mongoose.connection.db.collection('searchcaches');
-    const indexes = await scCollection.indexes();
-    for (const idx of indexes) {
-      const isStaleUnique = idx.unique && (
-        (Object.keys(idx.key).length === 1 && idx.key.userId) ||
-        (idx.key.userId && idx.key.searchId)
-      );
-      if (isStaleUnique) {
-        await scCollection.dropIndex(idx.name);
-        console.log(`🧹 Dropped stale index: ${idx.name}`);
-      }
-    }
-  } catch (idxErr) {
-    console.warn('⚠️ Could not clean stale indexes (non-fatal):', idxErr.message);
-  }
-
 } catch (err) {
   console.error('❌ MongoDB Connection Failed:', err);
   process.exit(1);
 }
 
 // ============================================================
-// --- SCHEMAS ---
+// --- SCHEMAS (only permanent collections remain) ---
 // ============================================================
 const Schema = mongoose.Schema;
 
-// Users (permanent – no TTL)
 const UserSchema = new Schema({
   userId:    { type: String, unique: true, index: true },
   firstName: String,
   username:  String,
   joinedAt:  { type: Date, default: Date.now },
-  isBanned:  { type: Boolean, default: false }
+  isBanned:  { type: Boolean, default: false, index: true },
+  isInactive:{ type: Boolean, default: false }
 });
 const User = mongoose.model('User', UserSchema);
 
-// Files (permanent – these are your indexed content)
 const FileSchema = new Schema({
   customId:   { type: String, unique: true, index: true },
   message_id: { type: Number, required: true },
@@ -117,13 +158,12 @@ const FileSchema = new Schema({
   uploaded_at:{ type: Date, default: Date.now, index: true },
   downloads:  { type: Number, default: 0, index: true }
 });
+
 const File = mongoose.model('File', FileSchema);
 
-// Counter (permanent – sequence generator)
 const CounterSchema = new Schema({ _id: String, seq: Number });
 const Counter = mongoose.model('Counter', CounterSchema);
 
-// Daily limits – auto-deleted after LIMIT_DOC_TTL_DAYS days
 const LimitSchema = new Schema({
   userId:    String,
   date:      String,
@@ -133,32 +173,6 @@ const LimitSchema = new Schema({
 LimitSchema.index({ userId: 1, date: 1 }, { unique: true });
 const Limit = mongoose.model('Limit', LimitSchema);
 
-// Member join cache – auto-deleted after MEMBER_DOC_TTL_DAYS days
-const MemberCacheSchema = new Schema({
-  userId:    { type: String, unique: true, index: true },
-  verified:  { type: Boolean, default: true },
-  cachedAt:  { type: Date, default: Date.now, expires: Number(MEMBER_DOC_TTL_DAYS) * 86400 }
-});
-const MemberCache = mongoose.model('MemberCache', MemberCacheSchema);
-
-// Search result pages – auto-deleted after SEARCH_CACHE_DOC_TTL_DAYS day(s)
-// Each search gets a unique searchId. No unique index to avoid E11000 errors.
-const SearchCacheSchema = new Schema({
-  userId:    { type: String, index: true },
-  searchId:  { type: String, index: true },
-  fileIds:   [String],
-  updatedAt: { type: Date, default: Date.now, expires: Number(SEARCH_CACHE_DOC_TTL_DAYS) * 86400 }
-});
-const SearchCache = mongoose.model('SearchCache', SearchCacheSchema);
-
-// Group cooldown – auto-deleted after 1 day (they are very short-lived anyway)
-const GroupCooldownSchema = new Schema({
-  chatId:    { type: String, unique: true, index: true },
-  createdAt: { type: Date, default: Date.now, expires: 86400 }
-});
-const GroupCooldown = mongoose.model('GroupCooldown', GroupCooldownSchema);
-
-// Favorites (permanent per user)
 const FavoriteSchema = new Schema({
   userId:  String,
   customId:String,
@@ -171,12 +185,6 @@ const Favorite = mongoose.model('Favorite', FavoriteSchema);
 // --- HELPERS ---
 // ============================================================
 
-function autoDeleteMessage(bot, chatId, messageId, delayMs = 60000) {
-  setTimeout(() => {
-    bot.deleteMessage(chatId, messageId).catch(() => {});
-  }, delayMs);
-}
-
 async function nextSequence(name = 'file') {
   const doc = await Counter.findOneAndUpdate(
     { _id: name },
@@ -186,135 +194,96 @@ async function nextSequence(name = 'file') {
   return 'F' + String(doc.seq).padStart(4, '0');
 }
 
-// Atomically check AND increment the daily limit in a single logical operation.
-// Uses insert-or-conditional-update: tries to insert a fresh doc (first download today),
-// falls back to a conditional $inc if the doc already exists.
-// Returns true if the download is allowed, false if the daily limit is already reached.
+// Atomic check-and-increment (prevents race conditions)
 async function incrementIfUnderLimit(userId) {
   const today = new Date().toISOString().slice(0, 10);
   try {
-    // Fast path: first download today — insert doc with count=1
     await Limit.create({ userId, date: today, count: 1, createdAt: new Date() });
     return true;
   } catch (e) {
-    if (e.code !== 11000) throw e; // unexpected error — re-throw
-    // Doc already exists for today — increment only if still under limit
+    if (e.code !== 11000) throw e;
     const doc = await Limit.findOneAndUpdate(
       { userId, date: today, count: { $lt: DAILY_LIMIT_NUM } },
       { $inc: { count: 1 } },
       { new: true }
     ).lean();
-    return doc !== null; // null = limit already reached
+    return doc !== null;
   }
 }
 
 async function getUserLimitCount(userId) {
   const today = new Date().toISOString().slice(0, 10);
-  const doc = await Limit.findOne({ userId, date: today }).lean();
+  const doc = await Limit.findOne({ userId, date: today }).select('count').lean();
   return doc?.count || 0;
 }
 
 async function saveUser(msg) {
   if (!msg.from || msg.from.is_bot) return;
   const userId = String(msg.from.id);
-  try {
-    await User.updateOne(
-      { userId },
-      {
-        $set: { firstName: msg.from.first_name, username: msg.from.username },
-        $setOnInsert: { joinedAt: new Date(), isBanned: false }
-      },
-      { upsert: true }
-    );
-  } catch (err) {
-    console.error('saveUser error:', err.message);
-  }
-}
-
-async function isUserBanned(userId) {
-  const user = await User.findOne({ userId }, { isBanned: 1 }).lean();
-  return user?.isBanned === true;
-}
-
-// Member cache backed by MongoDB (replaces Redis isMember:*)
-async function getMemberCache(userId) {
-  const doc = await MemberCache.findOne({ userId }).lean();
-  return doc ? doc.verified : null;
-}
-
-async function setMemberCache(userId, verified) {
-  await MemberCache.findOneAndUpdate(
+  await User.updateOne(
     { userId },
-    { verified, cachedAt: new Date() },
+    {
+      $set: { firstName: msg.from.first_name, username: msg.from.username },
+      $setOnInsert: { joinedAt: new Date(), isBanned: false, isInactive: false }
+    },
     { upsert: true }
-  );
+  ).catch(err => console.error('saveUser error:', err.message));
 }
 
-async function clearMemberCache(userId) {
-  await MemberCache.deleteOne({ userId });
+// --- BAN CACHE ---
+async function isUserBanned(userId) {
+  const cached = banCache.get(userId);
+  if (cached !== undefined) return cached;
+  const user = await User.findOne({ userId }, { isBanned: 1 }).lean();
+  const banned = user?.isBanned === true;
+  banCache.set(userId, banned);
+  return banned;
 }
 
-// Group cooldown backed by MongoDB (replaces Redis group_cooldown:*)
-async function checkGroupCooldown(chatId) {
+function invalidateBanCache(userId) {
+  banCache.delete(userId);
+}
+
+// --- MEMBER CACHE ---
+function getMemberCache(userId) {
+  return memberCache.get(userId) ?? null;
+}
+
+function setMemberCacheEntry(userId, verified) {
+  memberCache.set(userId, verified);
+}
+
+function clearMemberCacheEntry(userId) {
+  memberCache.delete(userId);
+}
+
+// --- GROUP COOLDOWN ---
+function checkAndSetGroupCooldown(chatId) {
   const key = String(chatId);
-  const now = new Date();
-  const cutoff = new Date(now.getTime() - GROUP_COOLDOWN_TIME);
-  const existing = await GroupCooldown.findOne({ chatId: key }).lean();
-  if (existing && existing.createdAt > cutoff) return false;
-  // Upsert with fresh timestamp
-  await GroupCooldown.findOneAndUpdate(
-    { chatId: key },
-    { createdAt: now },
-    { upsert: true }
-  );
+  if (groupCooldownCache.get(key) !== undefined) return false; // still in cooldown
+  groupCooldownCache.set(key, true);
   return true;
 }
 
-// Search result cache — returns a unique searchId per session.
-async function cacheSearchResults(userId, fileIds) {
+// --- SEARCH CACHE ---
+function cacheSearchResults(userId, fileIds) {
   const searchId = Math.random().toString(36).slice(2) + Date.now().toString(36);
-  await SearchCache.create({ userId, searchId, fileIds, updatedAt: new Date() });
+  searchResultCache.set(`${userId}:${searchId}`, fileIds);
   return searchId;
 }
 
-async function getCachedPage(userId, searchId, page) {
-  const doc = await SearchCache.findOne({ userId, searchId }).lean();
-  if (!doc) return { ids: [], total: 0 };
-  const total = doc.fileIds.length;
+function getCachedPage(userId, searchId, page) {
+  const fileIds = searchResultCache.get(`${userId}:${searchId}`);
+  if (!fileIds) return { ids: [], total: 0 };
+  const total = fileIds.length;
   const start = page * RESULTS_PER_PAGE_NUM;
-  const ids = doc.fileIds.slice(start, start + RESULTS_PER_PAGE_NUM);
+  const ids = fileIds.slice(start, start + RESULTS_PER_PAGE_NUM);
   return { ids, total };
 }
 
-// Format search result button: size | title (no icon, size first for mobile)
+// --- MISC HELPERS ---
 function formatSearchBtn(f) {
   return `${f.file_size}  |  ${f.clean_title}`;
-}
-
-
-// Shared file delivery helper used by GET callback and SEARCH_SUGGEST.
-async function deliverFile(bot, chatId, fromId, customId) {
-  const file = await File.findOne({ customId }).lean();
-  if (!file) return bot.sendMessage(chatId, '❌ File no longer exists.');
-
-  // Atomically check AND increment in one DB operation to prevent race conditions
-  const allowed = await incrementIfUnderLimit(fromId);
-  if (!allowed) {
-    return bot.sendMessage(chatId, `⚠️ Daily limit of ${DAILY_LIMIT_NUM} reached. Resets at midnight UTC.`);
-  }
-
-  await File.updateOne({ _id: file._id }, { $inc: { downloads: 1 } });
-  const sent = await bot.copyMessage(chatId, STORAGE_CHANNEL_ID, file.message_id, {
-    caption:
-      `🎬 <b>${file.clean_title}</b>\n` +
-      `📦 Size: ${file.file_size}\n` +
-      `🎞 Type: ${file.type || 'file'}\n` +
-      `🆔 ID: <code>${file.customId}</code>\n\n` +
-      `⚠️ <i>Auto-deletes in ${PRIVATE_DELETE_TIME / 1000}s</i>`,
-    parse_mode: 'HTML',
-    reply_markup: { inline_keyboard: [[{ text: '❤️ Add to Favorites', callback_data: `FAV:${file.customId}` }]] }
-  });
-  autoDeleteMessage(bot, chatId, sent.message_id, PRIVATE_DELETE_TIME);
 }
 
 function cleanFileName(text) {
@@ -333,19 +302,57 @@ function formatSize(bytes) {
   return (bytes / 1e3).toFixed(1) + ' KB';
 }
 
-/**
- * FUZZY SEARCH
- * 1. Try exact keyword match ($all) first.
- * 2. If no results, fall back to $regex partial match on each word ≥ FUZZY_MIN_LEN chars.
- * Returns { files, isFuzzy }
- */
+// ============================================================
+// --- UNIFIED DELIVERY (all downloads go through here) ---
+// ============================================================
+async function deliverFile(bot, chatId, fromId, customId) {
+  const file = await File.findOne({ customId })
+    .select('message_id clean_title file_size type customId _id')
+    .lean();
+  if (!file) return bot.sendMessage(chatId, '❌ File no longer exists.');
+
+  const allowed = await incrementIfUnderLimit(fromId);
+  if (!allowed) {
+    return bot.sendMessage(chatId,
+      `⚠️ Daily limit of <b>${DAILY_LIMIT_NUM}</b> reached. Resets at midnight UTC.`,
+      { parse_mode: 'HTML' }
+    );
+  }
+
+  let sent;
+  try {
+    sent = await bot.copyMessage(chatId, STORAGE_CHANNEL_ID, file.message_id, {
+      caption:
+        `🎬 <b>${file.clean_title}</b>\n` +
+        `📦 Size: ${file.file_size}\n` +
+        `🎞 Type: ${file.type || 'file'}\n` +
+        `🆔 ID: <code>${file.customId}</code>\n\n` +
+        `⚠️ <i>Auto-deletes in ${PRIVATE_DELETE_TIME / 1000}s</i>`,
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: '❤️ Add to Favorites', callback_data: `FAV:${file.customId}` }]] }
+    });
+  } catch (err) {
+    // Refund the limit count so the user isn't penalised for a Telegram-side failure
+    const today = new Date().toISOString().slice(0, 10);
+    Limit.findOneAndUpdate({ userId: fromId, date: today }, { $inc: { count: -1 } }).catch(() => {});
+    console.error('copyMessage failed in deliverFile:', err.message);
+    return bot.sendMessage(chatId, '⚠️ Could not send the file. Please try again.').catch(() => {});
+  }
+
+  // Increment download count only after successful delivery
+  await File.updateOne({ _id: file._id }, { $inc: { downloads: 1 } });
+  scheduleDelete(bot, chatId, sent.message_id, PRIVATE_DELETE_TIME);
+}
+
+// ============================================================
+// --- SEARCH ---
+// ============================================================
 async function searchFiles(query, limit = 100) {
-  // Guard: ignore excessively long queries to prevent regex abuse
   if (query.length > 100) return { files: [], isFuzzy: false };
 
   const keywords = query.toLowerCase().split(/\s+/).filter(Boolean);
 
-  // --- Exact / phrase match ---
+  // Exact keyword match
   const exact = await File.find({ attributes: { $all: keywords } })
     .select('customId clean_title file_size uploaded_at')
     .sort({ uploaded_at: -1 })
@@ -354,22 +361,16 @@ async function searchFiles(query, limit = 100) {
 
   if (exact.length) return { files: exact, isFuzzy: false };
 
-  // --- Fuzzy fallback: each meaningful word as a partial regex ---
+  // Fuzzy fallback — partial regex per meaningful word
   const fuzzyWords = keywords.filter(w => w.length >= FUZZY_MIN_LEN);
   if (!fuzzyWords.length) return { files: [], isFuzzy: false };
 
-  const regexConditions = fuzzyWords.map(w => {
-    const escaped = w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    return {
-      attributes: {
-        $regex: escaped,
-        $options: 'i'
-      }
-    };
-  });
+  const regexConditions = fuzzyWords.map(w => ({
+    attributes: { $regex: '^' + w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' }
+  }));
 
   const fuzzy = await File.find({ $or: regexConditions })
-    .select('customId clean_title file_size uploaded_at attributes')
+    .select('customId clean_title file_size uploaded_at')
     .sort({ uploaded_at: -1 })
     .limit(limit)
     .lean();
@@ -377,44 +378,14 @@ async function searchFiles(query, limit = 100) {
   return { files: fuzzy, isFuzzy: true };
 }
 
-/**
- * SEARCH SUGGESTIONS
- * When both exact and fuzzy return nothing, pull popular titles and suggest
- * ones whose words partially overlap with the query.
- */
-async function getSearchSuggestions(query) {
-  const qWords = query.toLowerCase().split(/\s+/).filter(w => w.length >= 2);
-  if (!qWords.length) return [];
-
-  // Only pull files that have been downloaded at least once (downloads > 0).
-  // This avoids a full collection scan — the existing downloads index makes
-  // this filter essentially free and keeps the working set small.
-  const pool = await File.find({ downloads: { $gt: 0 } })
-    .select('clean_title customId')
-    .sort({ downloads: -1 })
-    .limit(200)
-    .lean();
-
-  const scored = pool
-    .map(f => {
-      const titleWords = f.clean_title.toLowerCase().split(/\s+/);
-      const score = qWords.reduce((acc, qw) => {
-        return acc + titleWords.filter(tw => tw.includes(qw) || qw.includes(tw)).length;
-      }, 0);
-      return { ...f, score };
-    })
-    .filter(f => f.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, SUGGESTION_LIMIT_NUM);
-
-  return scored;
-}
-
-async function verifyJoin(chatId, userId, fileCode = null) {
+// ============================================================
+// --- FORCE JOIN ---
+// ============================================================
+async function verifyJoin(bot, chatId, userId, fileCode = null) {
   if (!FORCE_CHANNEL_ID) return true;
   if (ADMIN_SET.has(userId)) return true;
 
-  const cached = await getMemberCache(userId);
+  const cached = getMemberCache(userId);
   if (cached === true) return true;
 
   try {
@@ -422,16 +393,15 @@ async function verifyJoin(chatId, userId, fileCode = null) {
     const isMember = ['creator', 'administrator', 'member'].includes(member.status);
 
     if (isMember) {
-      await setMemberCache(userId, true);
+      setMemberCacheEntry(userId, true);
       return true;
     }
 
-    // Build invite link
     let channelLink = 'https://t.me/';
     if (FORCE_CHANNEL_ID.startsWith('@')) {
       channelLink = `https://t.me/${FORCE_CHANNEL_ID.replace('@', '')}`;
     } else {
-      try { channelLink = await bot.exportChatInviteLink(FORCE_CHANNEL_ID); } catch (e) {}
+      try { channelLink = await bot.exportChatInviteLink(FORCE_CHANNEL_ID); } catch (_) {}
     }
 
     const callbackData = fileCode ? `CHECK_JOIN:${fileCode}` : 'CHECK_JOIN';
@@ -447,12 +417,12 @@ async function verifyJoin(chatId, userId, fileCode = null) {
     return false;
   } catch (err) {
     console.error('Force Join Error:', err.message);
-    return true; // If bot can't check (not admin), let user pass
+    return true; // If bot can't check (not admin), let user through
   }
 }
 
 // ============================================================
-// --- SERVER ---
+// --- SERVER + BOT SETUP ---
 // ============================================================
 const app = express();
 app.use(express.json());
@@ -460,8 +430,7 @@ app.use(express.json());
 const bot = new TelegramBot(TELEGRAM_TOKEN);
 bot.setWebHook(`${RENDER_EXTERNAL_URL}/bot${TELEGRAM_TOKEN}`);
 
-// Cache bot username once at startup to avoid repeated API calls
-const BOT_ME       = await bot.getMe();
+const BOT_ME = await bot.getMe();
 const BOT_USERNAME = BOT_ME.username;
 console.log(`✅ Bot @${BOT_USERNAME} ready`);
 
@@ -470,19 +439,39 @@ app.post(`/bot${TELEGRAM_TOKEN}`, (req, res) => {
   res.sendStatus(200);
 });
 
-app.get('/', (req, res) => res.send('Bot is running. 🚀'));
+app.get('/', (_, res) => res.send('Bot is running. 🚀'));
 app.listen(Number(PORT), () => console.log(`✅ Server on port ${PORT}`));
 
 // ============================================================
-// --- SET COMMAND MENU ---
+// --- SELF-PING (Keep Render free tier awake) ---
+// ============================================================
+async function selfPing() {
+  try {
+    const res = await fetch(RENDER_EXTERNAL_URL, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'text/html',
+        'Connection': 'keep-alive',
+      }
+    });
+    console.log(`🏓 Self-ping [${res.status}]`);
+  } catch (err) {
+    console.warn(`⚠️ Self-ping failed: ${err.message}`);
+  }
+}
+setInterval(selfPing, 14 * 60 * 1000);
+setTimeout(selfPing, 5000);
+
+// ============================================================
+// --- COMMAND MENU ---
 // ============================================================
 bot.setMyCommands([
-  { command: '/start',     description: 'Restart Bot' },
-  { command: '/recent',    description: 'New Uploads' },
-  { command: '/trending',  description: 'Popular Files' },
-  { command: '/favorites', description: 'My Saved Files' },
-  { command: '/myaccount', description: 'Check Limit' },
-  { command: '/help',      description: 'Help & Commands' },
+  { command: '/start',      description: 'Restart Bot' },
+  { command: '/recent',     description: 'New Uploads' },
+  { command: '/trending',   description: 'Popular Files' },
+  { command: '/favorites',  description: 'My Saved Files' },
+  { command: '/myaccount',  description: 'Check Limit' },
+  { command: '/help',       description: 'Help & Commands' },
 ]).catch(() => {});
 
 // ============================================================
@@ -496,25 +485,22 @@ bot.on('channel_post', async (msg) => {
   try {
     const rawName  = msg.caption || file.file_name || 'Unknown';
     const clean    = cleanFileName(rawName);
-    const size     = formatSize(file.file_size);
     const customId = await nextSequence();
 
     await File.create({
       customId,
-      message_id: msg.message_id,
-      file_name:  rawName,
-      type:       msg.video ? 'video' : 'document',
-      file_size:  size,
-      clean_title:clean,
-      attributes: clean.toLowerCase().split(/\s+/).filter(t => t.length > 0)
+      message_id:  msg.message_id,
+      file_name:   rawName,
+      type:        msg.video ? 'video' : 'document',
+      file_size:   formatSize(file.file_size),
+      clean_title: clean,
+      attributes:  clean.toLowerCase().split(/\s+/).filter(t => t.length > 0)
     });
 
-    const newCaption = `${msg.caption || ''}\n\n✅ <b>Indexed:</b> ${customId}`;
-    await bot.editMessageCaption(newCaption, {
-      chat_id: msg.chat.id,
-      message_id: msg.message_id,
-      parse_mode: 'HTML'
-    }).catch(() => {});
+    await bot.editMessageCaption(
+      `${msg.caption || ''}\n\n✅ <b>Indexed:</b> ${customId}`,
+      { chat_id: msg.chat.id, message_id: msg.message_id, parse_mode: 'HTML' }
+    ).catch(() => {});
 
   } catch (err) {
     console.error('Index Error:', err);
@@ -527,54 +513,36 @@ bot.on('channel_post', async (msg) => {
 
 // 1. /start
 bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
-  const chatId     = msg.chat.id;
-  const fromId     = String(msg.from.id);
-  const startParam = match[1];
+  const chatId    = msg.chat.id;
+  const fromId    = String(msg.from.id);
+  const startParam= match[1]?.trim();
 
   await saveUser(msg);
 
-  // Ban check
   if (await isUserBanned(fromId)) {
     return bot.sendMessage(chatId, '🚫 <b>You have been banned from using this bot.</b>', { parse_mode: 'HTML' });
   }
 
-  // Group: show private-chat button
+  // Group: redirect to private
   if (msg.chat.type !== 'private') {
     if (startParam) return;
-    const sent = await bot.sendMessage(chatId, `👋 <b>Hello! I work in Private Chat.</b>\nClick below to start:`, {
-      parse_mode: 'HTML',
-      reply_markup: { inline_keyboard: [[{ text: '🤖 Start Me', url: `https://t.me/${BOT_USERNAME}` }]] }
-    });
-    return autoDeleteMessage(bot, chatId, sent.message_id, 10000);
+    const sent = await bot.sendMessage(chatId,
+      `👋 <b>Hello! I work in Private Chat.</b>\nClick below to start:`, {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🤖 Start Me', url: `https://t.me/${BOT_USERNAME}` }]] }
+      });
+    return scheduleDelete(bot, chatId, sent.message_id, 10000);
   }
 
-  // Deep link (e.g. /start F0001)
-  if (startParam && /^F\d{4}$/i.test(startParam)) {
-    if (!await verifyJoin(chatId, fromId, startParam)) return;
-
+  // Deep link: /start F0001
+  if (startParam && /^F\d{4,}$/i.test(startParam)) {
     const customId = startParam.toUpperCase();
-    const file = await File.findOne({ customId }).lean();
-    if (!file) return bot.sendMessage(chatId, '❌ File not found.');
-
-    // Atomically check AND increment to prevent race conditions
-    const allowed = await incrementIfUnderLimit(fromId);
-    if (!allowed) {
-      return bot.sendMessage(chatId, '⚠️ Daily limit reached. Try again tomorrow.');
-    }
-
-    await File.updateOne({ _id: file._id }, { $inc: { downloads: 1 } });
-
-    const sent = await bot.copyMessage(chatId, STORAGE_CHANNEL_ID, file.message_id, {
-      caption: `🎬 <b>${file.clean_title}</b>\n📦 ${file.file_size}\n🆔 <code>${file.customId}</code>\n\n⚠️ <i>Auto-deletes in ${PRIVATE_DELETE_TIME / 1000}s</i>`,
-      parse_mode: 'HTML',
-      reply_markup: { inline_keyboard: [[{ text: '❤️ Favorite', callback_data: `FAV:${file.customId}` }]] }
-    });
-    autoDeleteMessage(bot, chatId, sent.message_id, PRIVATE_DELETE_TIME);
-    return;
+    if (!await verifyJoin(bot, chatId, fromId, customId)) return;
+    return deliverFile(bot, chatId, fromId, customId);
   }
 
   // Standard welcome
-  if (!await verifyJoin(chatId, fromId)) return;
+  if (!await verifyJoin(bot, chatId, fromId)) return;
   bot.sendMessage(chatId,
     `👋 <b>Welcome, ${msg.from.first_name}!</b>\n\n` +
     `🔎 <b>How to search:</b>\nSimply type the name of the movie.\n<i>Example: "Avengers" or "Breaking Bad"</i>\n\n` +
@@ -587,13 +555,11 @@ bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
 bot.onText(/\/help/, async (msg) => {
   if (msg.chat.type !== 'private') {
     const sent = await bot.sendMessage(msg.chat.id,
-      `ℹ️ <b>Help:</b> Type a movie/show name to search.\nTap below for full commands.`,
-      {
+      `ℹ️ <b>Help:</b> Type a movie/show name to search.\nTap below for full commands.`, {
         parse_mode: 'HTML',
         reply_markup: { inline_keyboard: [[{ text: '📖 Full Help', url: `https://t.me/${BOT_USERNAME}?start=help` }]] }
-      }
-    ).catch(() => null);
-    if (sent) autoDeleteMessage(bot, msg.chat.id, sent.message_id, 30000);
+      }).catch(() => null);
+    if (sent) scheduleDelete(bot, msg.chat.id, sent.message_id, 30000);
     return;
   }
 
@@ -612,6 +578,7 @@ bot.onText(/\/help/, async (msg) => {
       `\n\n👮‍♂️ <b>Admin Commands:</b>\n` +
       `/stats – Bot statistics\n` +
       `/broadcast – Message all users\n` +
+      `/cancel – Cancel active broadcast\n` +
       `/delete [ID] – Remove a file\n` +
       `/ban [userId] – Ban a user\n` +
       `/unban [userId] – Unban a user`;
@@ -622,36 +589,31 @@ bot.onText(/\/help/, async (msg) => {
 
 // 3. /trending
 bot.onText(/\/trending/, async (msg) => {
-  const chatId   = msg.chat.id;
-  const isGroup  = msg.chat.type !== 'private';
+  const chatId  = msg.chat.id;
+  const isGroup = msg.chat.type !== 'private';
 
-  if (isGroup && !await checkGroupCooldown(chatId)) return;
+  if (isGroup && !checkAndSetGroupCooldown(chatId)) return;
 
-  const files = await File.find().sort({ downloads: -1 }).limit(TRENDING_LIMIT_NUM).lean();
+  const files = await File.find()
+    .select('customId clean_title file_size downloads')
+    .sort({ downloads: -1 })
+    .limit(TRENDING_LIMIT_NUM)
+    .lean();
+
   if (!files.length) {
     const sent = await bot.sendMessage(chatId, 'No trending files yet.');
-    return autoDeleteMessage(bot, chatId, sent.message_id, 5000);
+    return scheduleDelete(bot, chatId, sent.message_id, 5000);
   }
 
-  if (isGroup) {
-    const keyboard = files.map(f => [{
-      text: `📥 ${f.file_size} | ${f.clean_title}`,
-      url: `https://t.me/${BOT_USERNAME}?start=${f.customId}`
-    }]);
-    const sent = await bot.sendMessage(chatId, '📈 <b>Top Trending:</b>', {
-      parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard }
-    }).catch(() => null);
-    if (sent) autoDeleteMessage(bot, chatId, sent.message_id, GROUP_DELETE_TIME);
-  } else {
-    const keyboard = files.map(f => [{
-      text: `🔥 ${f.file_size} | ${f.clean_title}`,
-      callback_data: `GET:${f.customId}`
-    }]);
-    const sent = await bot.sendMessage(chatId, '📈 <b>Top Trending:</b>', {
-      parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard }
-    }).catch(() => null);
-    if (sent) autoDeleteMessage(bot, chatId, sent.message_id, PRIVATE_DELETE_TIME);
-  }
+  const header  = '📈 <b>Top Trending:</b>';
+  const keyboard = isGroup
+    ? files.map(f => [{ text: `📥 ${f.file_size} | ${f.clean_title}`, url: `https://t.me/${BOT_USERNAME}?start=${f.customId}` }])
+    : files.map(f => [{ text: `🔥 ${f.file_size} | ${f.clean_title}`, callback_data: `GET:${f.customId}` }]);
+
+  const sent = await bot.sendMessage(chatId, header, {
+    parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard }
+  }).catch(() => null);
+  if (sent) scheduleDelete(bot, chatId, sent.message_id, isGroup ? GROUP_DELETE_TIME : PRIVATE_DELETE_TIME);
 });
 
 // 4. /recent
@@ -659,70 +621,91 @@ bot.onText(/\/recent/, async (msg) => {
   const chatId  = msg.chat.id;
   const isGroup = msg.chat.type !== 'private';
 
-  if (isGroup && !await checkGroupCooldown(chatId)) return;
+  if (isGroup && !checkAndSetGroupCooldown(chatId)) return;
 
-  const files = await File.find().sort({ uploaded_at: -1 }).limit(RECENT_LIMIT_NUM).lean();
+  const files = await File.find()
+    .select('customId clean_title file_size uploaded_at')
+    .sort({ uploaded_at: -1 })
+    .limit(RECENT_LIMIT_NUM)
+    .lean();
+
   if (!files.length) {
     const sent = await bot.sendMessage(chatId, 'No recent files.');
-    return autoDeleteMessage(bot, chatId, sent.message_id, 5000);
+    return scheduleDelete(bot, chatId, sent.message_id, 5000);
   }
 
-  if (isGroup) {
-    const keyboard = files.map(f => [{
-      text: `🆕 ${f.file_size} | ${f.clean_title}`,
-      url: `https://t.me/${BOT_USERNAME}?start=${f.customId}`
-    }]);
-    const sent = await bot.sendMessage(chatId, '🆕 <b>Recent Uploads:</b>', {
-      parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard }
-    }).catch(() => null);
-    if (sent) autoDeleteMessage(bot, chatId, sent.message_id, GROUP_DELETE_TIME);
-  } else {
-    const keyboard = files.map(f => [{
-      text: `📂 ${f.file_size} | ${f.clean_title}`,
-      callback_data: `GET:${f.customId}`
-    }]);
-    const sent = await bot.sendMessage(chatId, '🆕 <b>Recent Uploads:</b>', {
-      parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard }
-    }).catch(() => null);
-    if (sent) autoDeleteMessage(bot, chatId, sent.message_id, PRIVATE_DELETE_TIME);
-  }
+  const header  = '🆕 <b>Recent Uploads:</b>';
+  const keyboard = isGroup
+    ? files.map(f => [{ text: `🆕 ${f.file_size} | ${f.clean_title}`, url: `https://t.me/${BOT_USERNAME}?start=${f.customId}` }])
+    : files.map(f => [{ text: `📂 ${f.file_size} | ${f.clean_title}`, callback_data: `GET:${f.customId}` }]);
+
+  const sent = await bot.sendMessage(chatId, header, {
+    parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard }
+  }).catch(() => null);
+  if (sent) scheduleDelete(bot, chatId, sent.message_id, isGroup ? GROUP_DELETE_TIME : PRIVATE_DELETE_TIME);
 });
 
-// 5. /favorites & /myaccount
-bot.onText(/\/favorites|\/myaccount/, async (msg) => {
+// 5. /favorites
+bot.onText(/\/favorites/, async (msg) => {
   if (msg.chat.type !== 'private') {
     const sent = await bot.sendMessage(msg.chat.id, `⚠️ <b>This command is for Private Chat only!</b>`, {
       parse_mode: 'HTML',
       reply_markup: { inline_keyboard: [[{ text: '🤖 Open Private Chat', url: `https://t.me/${BOT_USERNAME}` }]] }
     });
-    return autoDeleteMessage(bot, msg.chat.id, sent.message_id, 10000);
+    return scheduleDelete(bot, msg.chat.id, sent.message_id, 10000);
   }
 
-  if (msg.text.includes('myaccount')) {
-    const used = await getUserLimitCount(String(msg.from.id));
-    const sent = await bot.sendMessage(msg.chat.id,
-      `👤 <b>Account</b>\nUsed Today: <b>${used}/${DAILY_LIMIT_NUM}</b>\n✅ Limit resets daily at midnight UTC`,
-      { parse_mode: 'HTML' }
-    );
-    return autoDeleteMessage(bot, msg.chat.id, sent.message_id, PRIVATE_DELETE_TIME);
-  }
+  const userId = String(msg.from.id);
+  const favs   = await Favorite.find({ userId }).select('customId').lean();
 
-  // /favorites
-  const favs = await Favorite.find({ userId: String(msg.from.id) }).lean();
   if (!favs.length) {
     const sent = await bot.sendMessage(msg.chat.id, '❤️ No favorites saved yet. Press the ❤️ button on any file to save it!');
-    return autoDeleteMessage(bot, msg.chat.id, sent.message_id, 8000);
+    return scheduleDelete(bot, msg.chat.id, sent.message_id, 8000);
   }
 
-  const files = await File.find({ customId: { $in: favs.map(f => f.customId) } }).lean();
+  const allFavIds = favs.map(f => f.customId);
+  const total     = allFavIds.length;
+  const pageIds   = allFavIds.slice(0, RESULTS_PER_PAGE_NUM); // page 0
+
+  const files    = await File.find({ customId: { $in: pageIds } }).select('customId clean_title file_size').lean();
   const keyboard = files.map(f => [{ text: `⭐ ${f.file_size} | ${f.clean_title}`, callback_data: `GET:${f.customId}` }]);
-  const sent = await bot.sendMessage(msg.chat.id, `❤️ <b>Your Favorites (${files.length}/${FAV_LIMIT_NUM}):</b>`, {
-    parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard }
-  });
-  autoDeleteMessage(bot, msg.chat.id, sent.message_id, PRIVATE_DELETE_TIME);
+
+  if (total > RESULTS_PER_PAGE_NUM) {
+    // Cache all IDs and start pagination from page 1 (0-based internally)
+    const favSearchId = cacheSearchResults(userId + '_fav', allFavIds);
+    keyboard.push([{ text: `Page 1 of ${Math.ceil(total / RESULTS_PER_PAGE_NUM)} ➡️`, callback_data: `PAGE_FAV:1:${favSearchId}` }]);
+  }
+
+  // total here = favs.length from Favorite collection, so it's always accurate on initial load
+  const totalPages = Math.ceil(total / RESULTS_PER_PAGE_NUM);
+  const headerText = total > RESULTS_PER_PAGE_NUM
+    ? `❤️ <b>Your Favorites (${total}/${FAV_LIMIT_NUM}):</b>\n<i>Page 1 of ${totalPages}</i>`
+    : `❤️ <b>Your Favorites (${total}/${FAV_LIMIT_NUM}):</b>`;
+  const sent = await bot.sendMessage(msg.chat.id, headerText,
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } }
+  );
+  scheduleDelete(bot, msg.chat.id, sent.message_id, PRIVATE_DELETE_TIME);
 });
 
-// 6. /stats (Admin Only)
+// 6. /myaccount
+bot.onText(/\/myaccount/, async (msg) => {
+  if (msg.chat.type !== 'private') {
+    const sent = await bot.sendMessage(msg.chat.id, `⚠️ <b>This command is for Private Chat only!</b>`, {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: '🤖 Open Private Chat', url: `https://t.me/${BOT_USERNAME}` }]] }
+    });
+    return scheduleDelete(bot, msg.chat.id, sent.message_id, 10000);
+  }
+
+  const used = await getUserLimitCount(String(msg.from.id));
+  const sent = await bot.sendMessage(msg.chat.id,
+    `👤 <b>Account</b>\nUsed Today: <b>${used}/${DAILY_LIMIT_NUM}</b>\n✅ Limit resets daily at midnight UTC`,
+    { parse_mode: 'HTML' }
+  );
+  scheduleDelete(bot, msg.chat.id, sent.message_id, PRIVATE_DELETE_TIME);
+});
+
+// 7. /stats (Admin)
 bot.onText(/\/stats/, async (msg) => {
   if (!ADMIN_SET.has(String(msg.from.id))) return;
 
@@ -741,10 +724,22 @@ bot.onText(/\/stats/, async (msg) => {
   );
 });
 
-// 7. /broadcast (Admin Only)
+// 8. /broadcast (Admin) with /cancel support
+let broadcastAbort  = false;
+let broadcastActive = false;
+
+bot.onText(/\/cancel/, async (msg) => {
+  if (!ADMIN_SET.has(String(msg.from.id))) return;
+  if (!broadcastActive) {
+    return bot.sendMessage(msg.chat.id, 'ℹ️ No broadcast is currently running.');
+  }
+  broadcastAbort = true;
+  bot.sendMessage(msg.chat.id, '🛑 Broadcast cancellation requested.');
+});
+
 bot.onText(/\/broadcast(?: (.+))?/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const fromId = String(msg.from.id);
+  const chatId  = msg.chat.id;
+  const fromId  = String(msg.from.id);
   if (!ADMIN_SET.has(fromId)) return;
 
   const text     = match[1];
@@ -757,118 +752,132 @@ bot.onText(/\/broadcast(?: (.+))?/, async (msg, match) => {
     );
   }
 
-  const users = await User.find({ isBanned: false }, { userId: 1 }).lean();
-  let success = 0, blocked = 0;
+  broadcastAbort  = false;
+  broadcastActive = true;
 
-  const sentMsg = await bot.sendMessage(chatId, `🚀 Broadcasting to ${users.length} users...`);
+  // Use cursor to avoid loading all users into memory
+  // Use $ne:true so existing users who predate the isInactive field are included
+  const cursor = User.find({ isBanned: { $ne: true }, isInactive: { $ne: true } }, { userId: 1 }).lean().cursor();
 
-  for (const user of users) {
+  let total = 0, success = 0, blocked = 0;
+  const statusMsg = await bot.sendMessage(chatId, `🚀 Broadcast started…`);
+
+  const CHUNK = 25;
+  let chunk = [];
+
+  async function sendToUser(userId) {
     let sent = false;
     while (!sent) {
       try {
         if (replyMsg) {
-          await bot.copyMessage(user.userId, chatId, replyMsg.message_id);
+          await bot.copyMessage(userId, chatId, replyMsg.message_id);
         } else {
-          await bot.sendMessage(user.userId, text, { parse_mode: 'HTML' });
+          await bot.sendMessage(userId, text, { parse_mode: 'HTML' });
         }
         success++;
         sent = true;
       } catch (err) {
         if (err.response?.statusCode === 429) {
-          // Rate limited — wait the time Telegram tells us, then retry same user
-          const retryAfter = err.response?.body?.parameters?.retry_after ?? err.retryAfter ?? 5;
+          const retryAfter = err.response?.body?.parameters?.retry_after ?? 5;
           await new Promise(r => setTimeout(r, retryAfter * 1000));
-          // loop continues → retries this same user
         } else {
-          // 403 = bot blocked by user; anything else = skip
-          if (err.response?.statusCode === 403) blocked++;
+          if (err.response?.statusCode === 403) {
+            blocked++;
+            // Mark as inactive so future broadcasts skip them
+            User.updateOne({ userId }, { $set: { isInactive: true } }).catch(() => {});
+          }
           sent = true;
         }
       }
     }
-    await new Promise(r => setTimeout(r, 50));
   }
 
+  async function processChunk(users) {
+    for (const user of users) {
+      if (broadcastAbort) break;
+      await sendToUser(user.userId);
+      total++;
+      await new Promise(r => setTimeout(r, 50)); // rate limiting gap
+    }
+  }
+
+  try {
+    // Process cursor in chunks, yielding to event loop between each
+    for await (const user of cursor) {
+      if (broadcastAbort) break;
+      chunk.push(user);
+      if (chunk.length >= CHUNK) {
+        await processChunk(chunk);
+        chunk = [];
+        // Yield to event loop
+        await new Promise(r => setImmediate(r));
+      }
+    }
+    if (chunk.length) await processChunk(chunk);
+  } catch (broadcastErr) {
+    console.error('Broadcast error:', broadcastErr);
+  } finally {
+    // Always reset flag so /cancel and future /broadcast work correctly
+    broadcastActive = false;
+  }
+
+  const status = broadcastAbort ? '🛑 Broadcast cancelled' : '✅ Broadcast complete';
   bot.editMessageText(
-    `✅ <b>Broadcast Complete</b>\n\nSent: ${success}\nBlocked/Failed: ${blocked}`,
-    { chat_id: chatId, message_id: sentMsg.message_id, parse_mode: 'HTML' }
-  );
+    `${status}\n\n📤 Sent: <b>${success}</b>\n🚫 Blocked/Inactive: <b>${blocked}</b>\n👥 Reached: <b>${total}</b>`,
+    { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'HTML' }
+  ).catch(() => {});
 });
 
-// 8. /delete (Admin Only)
+// 9. /delete (Admin)
 bot.onText(/\/delete (.+)/, async (msg, match) => {
   if (!ADMIN_SET.has(String(msg.from.id))) return;
 
   const customId = match[1].trim().toUpperCase();
   const result   = await File.deleteOne({ customId });
 
-  if (result.deletedCount > 0) {
-    bot.sendMessage(msg.chat.id,
-      `🗑️ <b>Deleted:</b> File <code>${customId}</code> has been removed.`,
-      { parse_mode: 'HTML' }
-    );
-  } else {
-    bot.sendMessage(msg.chat.id,
-      `❌ <b>Not found:</b> <code>${customId}</code>`,
-      { parse_mode: 'HTML' }
-    );
-  }
+  bot.sendMessage(msg.chat.id,
+    result.deletedCount > 0
+      ? `🗑️ <b>Deleted:</b> File <code>${customId}</code> has been removed.`
+      : `❌ <b>Not found:</b> <code>${customId}</code>`,
+    { parse_mode: 'HTML' }
+  );
 });
 
-// 9. /ban (Admin Only)
+// 10. /ban (Admin)
 bot.onText(/\/ban (.+)/, async (msg, match) => {
   if (!ADMIN_SET.has(String(msg.from.id))) return;
 
   const targetId = match[1].trim();
-  const result   = await User.findOneAndUpdate(
-    { userId: targetId },
-    { isBanned: true },
-    { new: true }
-  );
+  const result   = await User.findOneAndUpdate({ userId: targetId }, { isBanned: true }, { new: true });
 
   if (result) {
-    bot.sendMessage(msg.chat.id,
-      `🚫 <b>User <code>${targetId}</code> has been banned.</b>`,
-      { parse_mode: 'HTML' }
-    );
+    invalidateBanCache(targetId); // immediate cache invalidation
+    bot.sendMessage(msg.chat.id, `🚫 <b>User <code>${targetId}</code> has been banned.</b>`, { parse_mode: 'HTML' });
   } else {
-    bot.sendMessage(msg.chat.id,
-      `❌ User <code>${targetId}</code> not found in database.`,
-      { parse_mode: 'HTML' }
-    );
+    bot.sendMessage(msg.chat.id, `❌ User <code>${targetId}</code> not found in database.`, { parse_mode: 'HTML' });
   }
 });
 
-// 10. /unban (Admin Only)
+// 11. /unban (Admin)
 bot.onText(/\/unban (.+)/, async (msg, match) => {
   if (!ADMIN_SET.has(String(msg.from.id))) return;
 
   const targetId = match[1].trim();
-  const result   = await User.findOneAndUpdate(
-    { userId: targetId },
-    { isBanned: false },
-    { new: true }
-  );
+  const result   = await User.findOneAndUpdate({ userId: targetId }, { isBanned: false }, { new: true });
 
   if (result) {
-    bot.sendMessage(msg.chat.id,
-      `✅ <b>User <code>${targetId}</code> has been unbanned.</b>`,
-      { parse_mode: 'HTML' }
-    );
+    invalidateBanCache(targetId); // immediate cache invalidation
+    bot.sendMessage(msg.chat.id, `✅ <b>User <code>${targetId}</code> has been unbanned.</b>`, { parse_mode: 'HTML' });
   } else {
-    bot.sendMessage(msg.chat.id,
-      `❌ User <code>${targetId}</code> not found in database.`,
-      { parse_mode: 'HTML' }
-    );
+    bot.sendMessage(msg.chat.id, `❌ User <code>${targetId}</code> not found in database.`, { parse_mode: 'HTML' });
   }
 });
 
 // ============================================================
-// --- MAIN MESSAGE LOGIC ---
+// --- MAIN MESSAGE HANDLER (search pipeline) ---
 // ============================================================
 bot.on('message', async (msg) => {
-
-  // Bot added to group – show welcome
+  // Bot added to group
   if (msg.new_chat_members) {
     const isMe = msg.new_chat_members.find(m => m.username === BOT_USERNAME);
     if (isMe) {
@@ -891,30 +900,30 @@ bot.on('message', async (msg) => {
   const isGroup = msg.chat.type !== 'private';
   const text    = msg.text.trim();
 
-  // Ignore queries shorter than 3 characters
   if (text.length < 3) return;
 
-  // Ban check
+  // Pipeline: Ban → Cooldown (group) → Member check → Search
   if (await isUserBanned(fromId)) return;
 
-  // ---- GROUP SEARCH ----
   if (isGroup) {
-    if (!await checkGroupCooldown(chatId)) return;
+    if (!checkAndSetGroupCooldown(chatId)) return;
 
-    const { files: allGroupMatches, isFuzzy } = await searchFiles(text, 100);
+    const { files: allMatches, isFuzzy } = await searchFiles(text, 100);
 
-    if (allGroupMatches.length > 0) {
-      const groupFileIds = allGroupMatches.map(f => f.customId);
-      const groupSearchId = await cacheSearchResults(fromId, groupFileIds);
-      const { ids: gIds, total: gTotal } = await getCachedPage(fromId, groupSearchId, 0);
-      const gFiles = await File.find({ customId: { $in: gIds } }).sort({ uploaded_at: -1 }).lean();
+    if (allMatches.length > 0) {
+      const groupSearchId = cacheSearchResults(fromId, allMatches.map(f => f.customId));
+      const { ids: gIds, total: gTotal } = getCachedPage(fromId, groupSearchId, 0);
+      const gFiles = await File.find({ customId: { $in: gIds } })
+        .select('customId clean_title file_size')
+        .sort({ uploaded_at: -1 })
+        .lean();
 
-      const header = isFuzzy
+      const header   = isFuzzy
         ? `🔍 <b>Fuzzy results for "${text}" (${gTotal} total):</b>`
         : `🔍 <b>Found ${gTotal} result(s):</b>`;
       const keyboard = gFiles.map(f => [{
         text: `${f.file_size}  |  ${f.clean_title}`,
-        url: `https://t.me/${BOT_USERNAME}?start=${f.customId}`
+        url:  `https://t.me/${BOT_USERNAME}?start=${f.customId}`
       }]);
       if (gTotal > RESULTS_PER_PAGE_NUM) {
         keyboard.push([{ text: `Page 1 of ${Math.ceil(gTotal / RESULTS_PER_PAGE_NUM)} ➡️`, callback_data: `PAGE_G:1:${groupSearchId}` }]);
@@ -922,58 +931,43 @@ bot.on('message', async (msg) => {
       const sent = await bot.sendMessage(chatId, header, {
         parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard }
       }).catch(() => null);
-      if (sent) autoDeleteMessage(bot, chatId, sent.message_id, GROUP_DELETE_TIME);
+      if (sent) scheduleDelete(bot, chatId, sent.message_id, GROUP_DELETE_TIME);
 
     } else {
-      const suggestions = await getSearchSuggestions(text);
-      let noResultText = `🤷‍♂️ <b>Could not find "${text}"</b>\nTry checking the spelling.`;
-      if (suggestions.length) {
-        noResultText += `\n\n💡 <b>Did you mean:</b>\n` +
-          suggestions.map(s => `• ${s.clean_title}`).join('\n');
-      }
-      const sent = await bot.sendMessage(chatId, noResultText, { parse_mode: 'HTML' }).catch(() => null);
-      if (sent) autoDeleteMessage(bot, chatId, sent.message_id, NO_RESULT_DELETE_TIME);
+      const sent = await bot.sendMessage(chatId,
+        `🤷‍♂️ <b>Could not find "${text}"</b>\nTry checking the spelling.`,
+        { parse_mode: 'HTML' }
+      ).catch(() => null);
+      if (sent) scheduleDelete(bot, chatId, sent.message_id, NO_RESULT_DELETE_TIME);
     }
     return;
   }
 
   // ---- PRIVATE SEARCH ----
   await saveUser(msg);
-  if (!await verifyJoin(chatId, fromId)) return;
+  if (!await verifyJoin(bot, chatId, fromId)) return;
 
   try {
     const { files: allMatches, isFuzzy } = await searchFiles(text, 100);
 
     if (!allMatches.length) {
-      const suggestions = await getSearchSuggestions(text);
-      let noResultText = `🔍 <b>No results for "${text}".</b>`;
-
-      if (suggestions.length) {
-        noResultText += `\n\n💡 <b>Did you mean one of these?</b>`;
-        const suggKeyboard = suggestions.map(s => [{
-          text: `🔎 ${s.clean_title}`,
-          callback_data: `SEARCH_SUGGEST:${s.customId}`
-        }]);
-        const sent = await bot.sendMessage(chatId, noResultText, {
-          parse_mode: 'HTML',
-          reply_markup: { inline_keyboard: suggKeyboard }
-        });
-        return autoDeleteMessage(bot, chatId, sent.message_id, PRIVATE_DELETE_TIME);
-      }
-
-      const sent = await bot.sendMessage(chatId, noResultText, { parse_mode: 'HTML' });
-      return autoDeleteMessage(bot, chatId, sent.message_id, NO_RESULT_DELETE_TIME);
+      const sent = await bot.sendMessage(chatId,
+        `🔍 <b>No results for "${text}".</b>\nTry different keywords or check spelling.`,
+        { parse_mode: 'HTML' }
+      );
+      return scheduleDelete(bot, chatId, sent.message_id, NO_RESULT_DELETE_TIME);
     }
 
-    const fileIds  = allMatches.map(f => f.customId);
-    const searchId = await cacheSearchResults(fromId, fileIds);
-    const { ids, total } = await getCachedPage(fromId, searchId, 0);
-    const files = await File.find({ customId: { $in: ids } }).sort({ uploaded_at: -1 }).lean();
+    const searchId    = cacheSearchResults(fromId, allMatches.map(f => f.customId));
+    const { ids, total } = getCachedPage(fromId, searchId, 0);
+    const files       = await File.find({ customId: { $in: ids } })
+      .select('customId clean_title file_size')
+      .sort({ uploaded_at: -1 })
+      .lean();
 
-    const header = isFuzzy
+    const header   = isFuzzy
       ? `🔍 Found <b>${total}</b> fuzzy match(es) for "<i>${text}</i>":`
       : `🔍 Found <b>${total}</b> file(s):`;
-
     const keyboard = files.map(f => [{ text: formatSearchBtn(f), callback_data: `GET:${f.customId}` }]);
 
     if (total > RESULTS_PER_PAGE_NUM) {
@@ -981,10 +975,9 @@ bot.on('message', async (msg) => {
     }
 
     const sent = await bot.sendMessage(chatId, header, {
-      parse_mode: 'HTML',
-      reply_markup: { inline_keyboard: keyboard }
+      parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard }
     }).catch(() => null);
-    if (sent) autoDeleteMessage(bot, chatId, sent.message_id, PRIVATE_DELETE_TIME);
+    if (sent) scheduleDelete(bot, chatId, sent.message_id, PRIVATE_DELETE_TIME);
 
   } catch (err) {
     console.error('Private search error:', err);
@@ -992,7 +985,7 @@ bot.on('message', async (msg) => {
       `⚠️ <b>Something went wrong while searching.</b>\nPlease try again in a moment.`,
       { parse_mode: 'HTML' }
     ).catch(() => null);
-    if (sent) autoDeleteMessage(bot, chatId, sent.message_id, NO_RESULT_DELETE_TIME);
+    if (sent) scheduleDelete(bot, chatId, sent.message_id, NO_RESULT_DELETE_TIME);
   }
 });
 
@@ -1004,102 +997,133 @@ bot.on('callback_query', async (q) => {
   const fromId = String(q.from.id);
   const data   = q.data;
 
-  // Ban check
-  if (await isUserBanned(fromId)) {
-    return bot.answerCallbackQuery(q.id, { text: '🚫 You are banned.', show_alert: true });
-  }
-
-  // --- CHECK JOIN ---
-  if (data.startsWith('CHECK_JOIN')) {
-    const parts    = data.split(':');
-    const fileCode = parts[1] || null;
-
-    await clearMemberCache(fromId);
-
-    if (await verifyJoin(chatId, fromId, fileCode)) {
-      bot.sendMessage(chatId, '✅ Thanks! You can now search for files.');
-      bot.deleteMessage(chatId, q.message.message_id).catch(() => {});
-    } else {
-      bot.answerCallbackQuery(q.id, { text: '❌ You have not joined yet!', show_alert: true });
-    }
-    return;
-  }
-
-  if (!await verifyJoin(chatId, fromId)) {
-    return bot.answerCallbackQuery(q.id, { text: 'Please join the channel first!' });
-  }
-
   try {
-    // --- SEARCH SUGGESTION CLICK — directly deliver the file, no re-search ---
-    if (data.startsWith('SEARCH_SUGGEST:')) {
-      const suggCustomId = data.slice('SEARCH_SUGGEST:'.length);
-      const suggFile = await File.findOne({ customId: suggCustomId }, { clean_title: 1 }).lean();
-      if (!suggFile) return bot.answerCallbackQuery(q.id, { text: '❌ File no longer exists.', show_alert: true });
-      await bot.answerCallbackQuery(q.id, { text: `📂 Sending: ${suggFile.clean_title}` });
-      await deliverFile(bot, chatId, fromId, suggCustomId);
+    // Pipeline: Ban check first
+    if (await isUserBanned(fromId)) {
+      return bot.answerCallbackQuery(q.id, { text: '🚫 You are banned.', show_alert: true });
+    }
+
+    // CHECK_JOIN — skip member check here (user is confirming join)
+    if (data.startsWith('CHECK_JOIN')) {
+      const fileCode = data.split(':')[1] || null;
+      clearMemberCacheEntry(fromId);
+
+      if (await verifyJoin(bot, chatId, fromId, fileCode)) {
+        // Must answer callback query first — otherwise button spins forever
+        await bot.answerCallbackQuery(q.id, { text: '✅ Verified!' });
+        bot.sendMessage(chatId, '✅ Thanks! You can now search for files.');
+        bot.deleteMessage(chatId, q.message.message_id).catch(() => {});
+      } else {
+        bot.answerCallbackQuery(q.id, { text: '❌ You have not joined yet!', show_alert: true });
+      }
       return;
     }
 
-    // --- PAGINATION ---
+    // All other callbacks require join verification
+    if (!await verifyJoin(bot, chatId, fromId)) {
+      return bot.answerCallbackQuery(q.id, { text: 'Please join the channel first!' });
+    }
+
+    // --- PAGINATION (private search) ---
     if (data.startsWith('PAGE:')) {
-      const parts    = data.split(':');
-      const page     = Number(parts[1]);
-      const searchId = parts[2] || null;
+      const [, pageStr, searchId] = data.split(':');
+      const page = Number(pageStr);
       if (!searchId) return bot.answerCallbackQuery(q.id, { text: 'Search session expired. Please search again.' });
-      const { ids, total } = await getCachedPage(fromId, searchId, page);
+
+      const { ids, total } = getCachedPage(fromId, searchId, page);
       if (!ids.length) return bot.answerCallbackQuery(q.id, { text: 'Search expired. Please search again.' });
-      const files = await File.find({ customId: { $in: ids } }).sort({ uploaded_at: -1 }).lean();
+
+      const files    = await File.find({ customId: { $in: ids } })
+        .select('customId clean_title file_size')
+        .sort({ uploaded_at: -1 })
+        .lean();
       const keyboard = files.map(f => [{ text: formatSearchBtn(f), callback_data: `GET:${f.customId}` }]);
-      const nav = [];
+      const nav      = [];
       if (page > 0) nav.push({ text: '⬅️ Prev', callback_data: `PAGE:${page - 1}:${searchId}` });
       if ((page + 1) * RESULTS_PER_PAGE_NUM < total) nav.push({ text: 'Next ➡️', callback_data: `PAGE:${page + 1}:${searchId}` });
       if (nav.length) keyboard.push(nav);
+
       await bot.editMessageText(
         `🔍 Results — Page <b>${page + 1}</b> of <b>${Math.ceil(total / RESULTS_PER_PAGE_NUM)}</b>`,
         { chat_id: chatId, message_id: q.message.message_id, parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } }
       );
+      bot.answerCallbackQuery(q.id);
+      return;
+    }
+
+    // --- FAVORITES PAGINATION ---
+    if (data.startsWith('PAGE_FAV:')) {
+      const [, pageStr, searchId] = data.split(':');
+      const page = Number(pageStr);
+      if (!searchId) return bot.answerCallbackQuery(q.id, { text: 'Session expired. Please run /favorites again.' });
+
+      const { ids, total: cachedTotal } = getCachedPage(fromId + '_fav', searchId, page);
+      if (!ids.length) return bot.answerCallbackQuery(q.id, { text: 'Session expired. Please run /favorites again.' });
+
+      // Fetch fresh count from DB so header stays accurate even if files were deleted
+      const [files, freshTotal] = await Promise.all([
+        File.find({ customId: { $in: ids } }).select('customId clean_title file_size').lean(),
+        Favorite.countDocuments({ userId: fromId })
+      ]);
+      const keyboard   = files.map(f => [{ text: `⭐ ${f.file_size} | ${f.clean_title}`, callback_data: `GET:${f.customId}` }]);
+      const nav        = [];
+      if (page > 0) nav.push({ text: '⬅️ Prev', callback_data: `PAGE_FAV:${page - 1}:${searchId}` });
+      if ((page + 1) * RESULTS_PER_PAGE_NUM < cachedTotal) nav.push({ text: 'Next ➡️', callback_data: `PAGE_FAV:${page + 1}:${searchId}` });
+      if (nav.length) keyboard.push(nav);
+
+      const totalPages = Math.ceil(cachedTotal / RESULTS_PER_PAGE_NUM);
+      await bot.editMessageText(
+        `❤️ <b>Your Favorites (${freshTotal}/${FAV_LIMIT_NUM}):</b>\n<i>Page ${page + 1} of ${totalPages}</i>`,
+        { chat_id: chatId, message_id: q.message.message_id, parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } }
+      );
+      bot.answerCallbackQuery(q.id);
       return;
     }
 
     // --- GROUP PAGINATION ---
     if (data.startsWith('PAGE_G:')) {
-      const parts      = data.split(':');
-      const page       = Number(parts[1]);
-      const searchId   = parts[2] || null;
+      const [, pageStr, searchId] = data.split(':');
+      const page = Number(pageStr);
       if (!searchId) return bot.answerCallbackQuery(q.id, { text: 'Search session expired. Please search again.' });
-      const { ids, total } = await getCachedPage(fromId, searchId, page);
+
+      const { ids, total } = getCachedPage(fromId, searchId, page);
       if (!ids.length) return bot.answerCallbackQuery(q.id, { text: 'Search expired. Please search again.' });
-      const files = await File.find({ customId: { $in: ids } }).sort({ uploaded_at: -1 }).lean();
+
+      const files    = await File.find({ customId: { $in: ids } })
+        .select('customId clean_title file_size')
+        .sort({ uploaded_at: -1 })
+        .lean();
       const keyboard = files.map(f => [{
         text: `${f.file_size}  |  ${f.clean_title}`,
-        url: `https://t.me/${BOT_USERNAME}?start=${f.customId}`
+        url:  `https://t.me/${BOT_USERNAME}?start=${f.customId}`
       }]);
       const nav = [];
       if (page > 0) nav.push({ text: '⬅️ Prev', callback_data: `PAGE_G:${page - 1}:${searchId}` });
       if ((page + 1) * RESULTS_PER_PAGE_NUM < total) nav.push({ text: 'Next ➡️', callback_data: `PAGE_G:${page + 1}:${searchId}` });
       if (nav.length) keyboard.push(nav);
+
       await bot.editMessageText(
         `🔍 Results — Page <b>${page + 1}</b> of <b>${Math.ceil(total / RESULTS_PER_PAGE_NUM)}</b>`,
         { chat_id: chatId, message_id: q.message.message_id, parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } }
       );
+      bot.answerCallbackQuery(q.id);
       return;
     }
 
     // --- GET FILE ---
     if (data.startsWith('GET:')) {
-      const customId  = data.split(':')[1];
-      const fileCheck = await File.findOne({ customId }, { _id: 1 }).lean();
-      if (!fileCheck) return bot.answerCallbackQuery(q.id, { text: '❌ File no longer exists.', show_alert: true });
-      // No pre-check here — deliverFile handles the limit atomically to prevent race conditions
+      const customId = data.split(':')[1];
+      // answerCallbackQuery first so the button stops spinning immediately
       await bot.answerCallbackQuery(q.id, { text: '📤 Sending file...' });
+      // deliverFile handles "file not found" internally — no pre-check needed
       await deliverFile(bot, chatId, fromId, customId);
       return;
     }
 
-    // --- FAVORITE ---
+    // --- FAVORITE TOGGLE ---
     if (data.startsWith('FAV:')) {
       const customId = data.split(':')[1];
-      const exists   = await Favorite.findOne({ userId: fromId, customId });
+      const exists   = await Favorite.findOne({ userId: fromId, customId }).select('_id').lean();
 
       if (exists) {
         await Favorite.deleteOne({ userId: fromId, customId });
@@ -1132,5 +1156,5 @@ async function shutdown(signal) {
   await mongoose.disconnect();
   process.exit(0);
 }
-process.on('SIGINT',  () => shutdown('SIGINT'));   // Ctrl+C / local stop
-process.on('SIGTERM', () => shutdown('SIGTERM'));  // Render / Docker stop
+process.on('SIGINT',  () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
