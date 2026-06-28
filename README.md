@@ -4,18 +4,17 @@ A production-ready Telegram bot that indexes files from a private storage channe
 
 ---
 
-## ✨ Features
-
-### For Users
-- 🔎 **Smart Search** — Exact keyword match with automatic fuzzy fallback
-- 💡 **Search Suggestions** — Shows similar titles when nothing is found
-- 📄 **Paginated Results** — Browse results page by page
-- ❤️ **Favorites** — Save up to 50 files for quick access
-- 📈 **Trending** — See the most downloaded files
-- 🆕 **Recent** — Browse the latest uploads
-- 👤 **My Account** — Check daily download usage
-- ⏱️ **Auto-Delete** — Messages auto-delete to keep chats clean
-- 🔗 **Deep Links** — Share direct file links (works in groups too)
+## Features
+ 
+- **Search** — Two-stage search: exact keyword match → prefix fuzzy fallback
+- **Force Join** — Require users to join a channel before using the bot
+- **Daily Limits** — Per-user download limits, auto-reset at midnight UTC
+- **Favorites** — Users can save up to 50 files
+- **Trending & Recent** — Browse popular and newly added files
+- **Auto-Delete** — Files sent in groups/private auto-delete after a configurable delay
+- **Broadcast** — Admins can message all registered users
+- **Ban/Unban** — Admins can block users from using the bot
+- **In-memory caching** — TTL caches for member checks, search results, and cooldowns
 
 ### For Groups
 - Group members can search directly in the chat
@@ -72,50 +71,6 @@ Create a `.env` file in the root directory. All variables marked **required** mu
 | `RENDER_EXTERNAL_URL` | ✅ | — | Your Render app URL (e.g. `https://your-app.onrender.com`) |
 | `ADMIN_IDS` | ✅ | `''` | Comma-separated Telegram user IDs with admin access |
 | `FORCE_CHANNEL_ID` | ⚠️ | — | Channel ID or `@username` users must join before using the bot |
-| `DAILY_LIMIT` | ➖ | `100` | Max downloads per user per day |
-| `RESULTS_PER_PAGE` | ➖ | `10` | Search results shown per page |
-| `FAV_LIMIT` | ➖ | `50` | Max favorites per user |
-| `PRIVATE_AUTO_DELETE_MS` | ➖ | `60000` | How long (ms) private messages stay before auto-delete |
-| `GROUP_AUTO_DELETE_MS` | ➖ | `60000` | How long (ms) group messages stay before auto-delete |
-| `GROUP_COOLDOWN_MS` | ➖ | `2000` | Cooldown (ms) between searches in the same group |
-| `NO_RESULT_DELETE_MS` | ➖ | `60000` | How long (ms) "no results" messages stay |
-| `TRENDING_LIMIT` | ➖ | `10` | Number of files shown in `/trending` |
-| `RECENT_LIMIT` | ➖ | `10` | Number of files shown in `/recent` |
-| `FUZZY_MIN_WORD_LEN` | ➖ | `3` | Minimum word length for fuzzy search fallback |
-| `SUGGESTION_LIMIT` | ➖ | `5` | Max suggestions shown when no results found |
-| `LIMIT_DOC_TTL_DAYS` | ➖ | `2` | Days to keep daily-limit records in MongoDB |
-| `MEMBER_DOC_TTL_DAYS` | ➖ | `7` | Days to cache channel membership checks |
-| `SEARCH_CACHE_DOC_TTL_DAYS` | ➖ | `0.001` | Days to keep search result cache (~1.5 min) |
-
-### `.env.example`
-
-```env
-# Required
-TELEGRAM_TOKEN=your_bot_token_here
-MONGODB_URI=mongodb+srv://user:pass@cluster.mongodb.net/
-STORAGE_CHANNEL_ID=-100xxxxxxxxxx
-RENDER_EXTERNAL_URL=https://your-app.onrender.com
-
-# Recommended
-ADMIN_IDS=123456789,987654321
-FORCE_CHANNEL_ID=@your_channel
-
-# Optional (defaults shown)
-DAILY_LIMIT=100
-RESULTS_PER_PAGE=10
-FAV_LIMIT=50
-PRIVATE_AUTO_DELETE_MS=60000
-GROUP_AUTO_DELETE_MS=60000
-GROUP_COOLDOWN_MS=2000
-NO_RESULT_DELETE_MS=60000
-TRENDING_LIMIT=10
-RECENT_LIMIT=10
-FUZZY_MIN_WORD_LEN=3
-SUGGESTION_LIMIT=5
-LIMIT_DOC_TTL_DAYS=2
-MEMBER_DOC_TTL_DAYS=7
-SEARCH_CACHE_DOC_TTL_DAYS=0.001
-```
 
 ---
 
@@ -139,18 +94,10 @@ SEARCH_CACHE_DOC_TTL_DAYS=0.001
 4. Configure the service:
    - **Environment**: `Node`
    - **Build Command**: `npm install`
-   - **Start Command**: `node bot.js`
+   - **Start Command**: `npm start`
 5. Add all environment variables from the table above under **Environment**
 6. Set `RENDER_EXTERNAL_URL` to your Render app's URL (visible after first deploy)
 7. Click **Deploy**
-
-### 4. Verify
-After deploy, check the Render logs for:
-```
-✅ MongoDB Connected
-✅ Bot @your_bot_username ready
-✅ Server on port 3000
-```
 
 ---
 
@@ -197,53 +144,6 @@ node bot.js
 | `/delete <FILE_ID>` | Remove a file from the index |
 | `/ban <userId>` | Ban a user from the bot |
 | `/unban <userId>` | Unban a user |
-
----
-
-## 🗄️ Database Collections
-
-| Collection | TTL | Purpose |
-|---|---|---|
-| `users` | Never | User profiles and ban status |
-| `files` | Never | Indexed file metadata |
-| `counters` | Never | Auto-increment sequence for file IDs |
-| `limits` | `LIMIT_DOC_TTL_DAYS` | Daily download counts per user |
-| `membercaches` | `MEMBER_DOC_TTL_DAYS` | Channel membership verification cache |
-| `searchcaches` | `SEARCH_CACHE_DOC_TTL_DAYS` | Paginated search result sessions |
-| `groupcooldowns` | 1 day | Per-group search cooldown tracking |
-| `favorites` | Never | User-saved file references |
-
----
-
-## 🔍 How Search Works
-
-1. **Exact match** — Splits query into keywords and looks for files whose `attributes` array contains all of them (`$all`). Fast and precise.
-2. **Fuzzy fallback** — If nothing is found, runs a partial `$regex` match on each word ≥ `FUZZY_MIN_WORD_LEN` characters. Catches typos and partial titles.
-3. **Suggestions** — If both fail, scores the top 200 most-downloaded files by word overlap with the query and shows the best matches.
-
----
-
-## 📦 `package.json`
-
-Make sure your `package.json` includes `"type": "module"` since the bot uses ES module syntax (`import`/`export`):
-
-```json
-{
-  "name": "telegram-file-bot",
-  "version": "1.0.0",
-  "type": "module",
-  "main": "bot.js",
-  "scripts": {
-    "start": "node bot.js"
-  },
-  "dependencies": {
-    "dotenv": "^16.0.0",
-    "express": "^4.18.0",
-    "mongoose": "^8.0.0",
-    "node-telegram-bot-api": "^0.64.0"
-  }
-}
-```
 
 ---
 
