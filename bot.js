@@ -454,7 +454,8 @@ async function selfPing() {
         'Connection': 'keep-alive',
       }
     });
-    console.log(`🏓 Self-ping [${res.status}]`);
+    //console.log(`🏓 Self-ping [${res.status}]`);
+    if (!res.ok) console.warn(`⚠️ Self-ping unexpected status: ${res.status}`);
   } catch (err) {
     console.warn(`⚠️ Self-ping failed: ${err.message}`);
   }
